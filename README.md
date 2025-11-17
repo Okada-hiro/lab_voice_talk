@@ -3,10 +3,12 @@
 ## 紹介
 このレポジトリにあるファイルによってできることは、AIと日本語音声で会話することです。ここにあるファイルで、サーバを立ち上げ、ブラウザで開くとAIと会話をすることができます。タイピングやクリックがほとんど不要で、会話のような体験を実現しています(言い過ぎかもしれませんが)。  
 以下の三つのモデルを組み合わせて作ってあります。
+
 1. **whisper_streaming**: 日本語音声からの文字起こし(ASR)を行うモデルです。高速で高精度な文字起こしを行うモデルです。ユーザーからの質問内容を文字起こしします。難しかったため、ストリーミングは使っていません。  
     https://github.com/ufal/whisper_streaming.git
 
 2. **gemini-2.5-flash-mini**: 高速なLLMです。whisper_streamingが文字起こししてできたテキストを入力として受け取り、回答を生成します。
+
 3. **style-bert-vits2**: 高速な日本語音声生成モデルです。gemini-2.5-flash-miniが作った回答テキストをもとにして、日本語音声を生成します。  
     https://github.com/litagin02/Style-Bert-VITS2.git
 
@@ -15,6 +17,7 @@
 以下はRunPodというGPUが使えて、サーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingは動作が安定しませんが、CUDA12.8では動くことがわかっています。
 
 0. 予めpodの編集で、HTTP PORT 5000を有効にしてください。
+
 1. このレポジトリのクローンをしてください。
 git clone https://okhiro1207@bitbucket.org/concierge_tarou/lab_voice_talk.git
 cd lab_voice_tal
