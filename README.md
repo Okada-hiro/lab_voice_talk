@@ -1,29 +1,56 @@
-# README #
+# 日本語チャットボット
 
-This README would normally document whatever steps are necessary to get your application up and running.
+## 紹介
+このレポジトリにあるファイルによってできることは、AIと日本語音声で会話することです。ここにあるファイルで、サーバを立ち上げ、ブラウザで開くとAIと会話をすることができます。
+\
+以下の三つのモデルを組み合わせて作ってあります。
+1. whisper_streaming: 日本語音声からの文字起こし(ASR)を行うモデルです。高速で高精度な文字起こしを行うモデルです。ユーザーからの質問内容を文字起こしします。難しかったため、ストリーミングは使っていません。
+\
+    https://github.com/ufal/whisper_streaming.git
 
-### What is this repository for? ###
+2. gemini-2.5-flash-mini: 高速なLLMです。whisper_streamingが文字起こししてできたテキストを入力として受け取り、回答を生成します。
+3. style-bert-vits2: 高速な日本語音声生成モデルです。gemini-2.5-flash-miniが作った回答テキストをもとにして、日本語音声を生成します。
+\
+    https://github.com/litagin02/Style-Bert-VITS2.git
 
-* Quick summary
-* Version
-* [Learn Markdown](https://bitbucket.org/tutorials/markdowndemo)
 
-### How do I get set up? ###
+## 使い方
+以下はRunPodというGPUが使えて、サーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingは動作が安定しませんが、CUDA12.8では動くことがわかっています。
 
-* Summary of set up
-* Configuration
-* Dependencies
-* Database configuration
-* How to run tests
-* Deployment instructions
+0. 予めpodの編集で、HTTP PORT 5000を有効にしてください。
+1. このレポジトリのクローンをしてください。
+git clone https://github.com/Okada-hiro/Run-Pod.git
+cd Run-Pod
 
-### Contribution guidelines ###
+2. 必要なパッケージのインストールをしてください。
+bash setup_environment.sh
 
-* Writing tests
-* Code review
-* Other guidelines
+3. whisper_stremingのクローンをしてください。
+git clone https://github.com/ufal/whisper_streaming.git
 
-### Who do I talk to? ###
+4. style_bert_vits2のクローンをしてください。
+git clone https://github.com/litagin02/Style-Bert-VITS2.git
 
-* Repo owner or admin
-* Other community or team contact
+5. 名前の変更(-があると扱いづらい)をしてください。
+mv Style-Bert-VITS2 Style_Bert_VITS2
+6. ファインチューニング後のStyle-Bert-VITS2の重みを受け取ってください。
+python tensorfile_import.py
+mv Ref_voice/* Style_Bert_VITS2/model_assets
+
+7. gemini-2.5-flash-miniを使えるように、APIを設定してください。
+export GOOGLE_API_KEY=your_api_key
+
+8. 実行
+python main.py
+
+9. podのPORT5000をクリックして、ブラウザで開くことができるはずです。
+
+## 性能
+
+それなりの速度で、それなりの音声認識と音声再生が行われます。
+- 速度: ユーザーが話し終えてから大体2秒ぐらいで回答が表示され、4秒ぐらいで音声が再生されます。ただし、1回目の再生にはStyle-Bert-VITS2の起動も含まれるため、遅くなります。
+- 音声認識の正確さ: 現時点で、whisper_streamingの音声認識は人間より劣っています。はっきりと話してあげれば、しっかりと聞き取ってくれます。
+- 音声生成の自然さ: 現時点では、ファインチューニングが十分ではないため、生成される日本語音声は、まだギリギリ許容範囲だと感じられるレベルです。
+
+## 特徴
+タイピングやクリックがほとんど不要で、会話のような体験を実現しています(言い過ぎかもしれませんが)。
