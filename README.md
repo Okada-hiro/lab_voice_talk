@@ -1,7 +1,7 @@
 # 日本語チャットボット
 
 ## 紹介
-このレポジトリにあるファイルによってできることは、AIと日本語音声で会話することです。ここにあるファイルで、サーバを立ち上げ、ブラウザで開くとAIと会話をすることができます。
+このレポジトリにあるファイルによってできることは、AIと日本語音声で会話することです。ここにあるファイルで、サーバを立ち上げ、ブラウザで開くとAIと会話をすることができます。タイピングやクリックがほとんど不要で、会話のような体験を実現しています(言い過ぎかもしれませんが)。
 \
 以下の三つのモデルを組み合わせて作ってあります。
 1. whisper_streaming: 日本語音声からの文字起こし(ASR)を行うモデルです。高速で高精度な文字起こしを行うモデルです。ユーザーからの質問内容を文字起こしします。難しかったため、ストリーミングは使っていません。
@@ -19,30 +19,43 @@
 
 0. 予めpodの編集で、HTTP PORT 5000を有効にしてください。
 1. このレポジトリのクローンをしてください。
-git clone https://github.com/Okada-hiro/Run-Pod.git
-cd Run-Pod
+git clone https://okhiro1207@bitbucket.org/concierge_tarou/lab_voice_talk.git
+cd lab_voice_tal
 
 2. 必要なパッケージのインストールをしてください。
+```bash
 bash setup_environment.sh
+```
+
 
 3. whisper_stremingのクローンをしてください。
+```bash
 git clone https://github.com/ufal/whisper_streaming.git
-
+```
 4. style_bert_vits2のクローンをしてください。
+```bash
 git clone https://github.com/litagin02/Style-Bert-VITS2.git
+```
 
 5. 名前の変更(-があると扱いづらい)をしてください。
+```bash
 mv Style-Bert-VITS2 Style_Bert_VITS2
+```
 6. ファインチューニング後のStyle-Bert-VITS2の重みを受け取ってください。
+```bash
 python tensorfile_import.py
 mv Ref_voice/* Style_Bert_VITS2/model_assets
+```
 
 7. gemini-2.5-flash-miniを使えるように、APIを設定してください。
+```bash
 export GOOGLE_API_KEY=your_api_key
+```
 
 8. 実行
+```bash
 python main.py
-
+```
 9. podのPORT5000をクリックして、ブラウザで開くことができるはずです。
 
 ## 性能
@@ -52,5 +65,5 @@ python main.py
 - 音声認識の正確さ: 現時点で、whisper_streamingの音声認識は人間より劣っています。はっきりと話してあげれば、しっかりと聞き取ってくれます。
 - 音声生成の自然さ: 現時点では、ファインチューニングが十分ではないため、生成される日本語音声は、まだギリギリ許容範囲だと感じられるレベルです。
 
-## 特徴
-タイピングやクリックがほとんど不要で、会話のような体験を実現しています(言い過ぎかもしれませんが)。
+
+
