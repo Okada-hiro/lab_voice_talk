@@ -13,11 +13,11 @@
     https://github.com/litagin02/Style-Bert-VITS2.git
 
 ## 環境
-以下はRunPodというGPUが使えてサーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingが要求する環境が厳しいため、requirements.txtに記しておきます。
+以下はRunPodというGPUが使えてサーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingが限られたpytorchのバージョンを要求するため、requirements.txtに記しておきます。
 
 
 ## 使い方
-RunPodでpodを作り、以下のコマンドを実行してください。webターミナルでも、SSH接続を用いたローカルのターミナルでも大丈夫です。また、予めpodの編集でHTTP PORT 5000を有効にしてください。
+RunPodでpodを作り、以下のコマンドを実行してください。webターミナルでも、SSH接続を用いたローカルのターミナルでも大丈夫です。また、予めpodの編集でHTTP PORT 8000を有効にしてください。
 
 
 1. このレポジトリのクローンをしてください。
