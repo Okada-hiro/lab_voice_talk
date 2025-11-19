@@ -61,7 +61,7 @@ export GOOGLE_API_KEY=your_api_key
 ```bash
 python main.py
 ```
-9. podのPORT5000をクリックして、ブラウザで開くことができるはずです。
+9. ブラウザで、podのPORT8000のURLを検索して、会話を開始することができるはずです。
 
 ## 性能
 
