@@ -13,7 +13,9 @@
     https://github.com/litagin02/Style-Bert-VITS2.git
 
 ## 環境
-以下はRunPodというGPUが使えてサーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingが限られたpytorchのバージョンを要求するため、requirements.txtに記しておきます。
+以下はRunPodというGPUが使えてサーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingが限られたpytorchのバージョンを要求します。具体的には以下の通りです。  
+pytorch=2.8.0+cu128, CUDA=12.8, cuDNN=9.10.2/libcudnnn9-cuda-12   
+互換性のためにtorchvisionとtorchaudioも同じバージョンにする必要があります。setup_environment.shを実行すれば自動でやってくれます。
 
 
 ## 使い方
