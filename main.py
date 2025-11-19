@@ -571,6 +571,6 @@ async def get_root():
 # サーバー起動
 # ---------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8000))
     logger.info(f"サーバーを http://0.0.0.0:{port} で起動します。")
     uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)
