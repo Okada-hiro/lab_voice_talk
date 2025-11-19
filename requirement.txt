@@ -1,21 +1,20 @@
-# Webフレームワーク
-fastapi
-uvicorn[standard] # WebSocketサポートを含む
-
-# OpenAI API
-openai
-
-# 音声認識 (Whisper)
-faster-whisper
+# PyTorch / 音声系
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+torchaudio==2.8.0+cu128
 librosa
-numpy # librosa や torch の依存]
-loguru
-
-# 音声合成 (Style-Bert-VITS2)
 scipy
-torch # ★注意: CUDA版は別途インストール推奨
-transformers # Style-Bert-VITS2 の BERTモデルロード用
 pyworld
+pyopenjtalk
+num2words
+pydub
 
-# Style-Bert-VITS2 本体 (GitHubから直接インストール)
-git+https://github.com/h-or-s/Style-Bert-VITS2.git
+# Web / AI系
+fastapi
+uvicorn[standard]
+google-generativeai
+openai
+huggingface_hub
+loguru
+transformers
+faster-whisper
