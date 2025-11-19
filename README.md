@@ -23,7 +23,7 @@ RunPodでpodを作り、以下のコマンドを実行してください。web�
 1. このレポジトリのクローンをしてください。
 ```bash
 git clone https://okhiro1207@bitbucket.org/concierge_tarou/lab_voice_talk.git
-cd lab_voice_tal
+cd lab_voice_talk
 ```
 
 2. 必要なパッケージのインストールをしてください。
