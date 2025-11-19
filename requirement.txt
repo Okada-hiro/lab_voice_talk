@@ -1,0 +1,21 @@
+# Webフレームワーク
+fastapi
+uvicorn[standard] # WebSocketサポートを含む
+
+# OpenAI API
+openai
+
+# 音声認識 (Whisper)
+faster-whisper
+librosa
+numpy # librosa や torch の依存]
+loguru
+
+# 音声合成 (Style-Bert-VITS2)
+scipy
+torch # ★注意: CUDA版は別途インストール推奨
+transformers # Style-Bert-VITS2 の BERTモデルロード用
+pyworld
+
+# Style-Bert-VITS2 本体 (GitHubから直接インストール)
+git+https://github.com/h-or-s/Style-Bert-VITS2.git

@@ -12,15 +12,19 @@
 3. **style-bert-vits2**: 高速な日本語音声生成モデルです。gemini-2.5-flash-miniが作った回答テキストをもとにして、日本語音声を生成します。  
     https://github.com/litagin02/Style-Bert-VITS2.git
 
+## 環境
+以下はRunPodというGPUが使えてサーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingが要求する環境が厳しいため、requirements.txtに記しておきます。
+
 
 ## 使い方
-以下はRunPodというGPUが使えて、サーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingは動作が安定しませんが、CUDA12.8では動くことがわかっています。
+RunPodでpodを作り、以下のコマンドを実行してください。webターミナルでも、SSH接続を用いたローカルのターミナルでも大丈夫です。また、予めpodの編集でHTTP PORT 5000を有効にしてください。
 
-0. 予めpodの編集で、HTTP PORT 5000を有効にしてください。
 
 1. このレポジトリのクローンをしてください。
+```bash
 git clone https://okhiro1207@bitbucket.org/concierge_tarou/lab_voice_talk.git
 cd lab_voice_tal
+```
 
 2. 必要なパッケージのインストールをしてください。
 ```bash
@@ -37,9 +41,10 @@ git clone https://github.com/ufal/whisper_streaming.git
 git clone https://github.com/litagin02/Style-Bert-VITS2.git
 ```
 
-5. 名前の変更(-があると扱いづらい)をしてください。
+5. 名前の変更(-があると扱いづらい)と、__ init __.pyの作成をしてください。
 ```bash
 mv Style-Bert-VITS2 Style_Bert_VITS2
+touch Style_Bert_VITS2/__init__.py
 ```
 6. ファインチューニング後のStyle-Bert-VITS2の重みを受け取ってください。
 ```bash
