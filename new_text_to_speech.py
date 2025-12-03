@@ -2,6 +2,7 @@
 import torch
 from pathlib import Path
 from scipy.io.wavfile import write
+import scipy.signal
 import os
 import numpy as np
 import sys
@@ -97,6 +98,26 @@ try:
         print(f"利用可能な話者: {list(GLOBAL_TTS_MODEL.spk2id.keys())}")
         raise
 
+    # --- ★追加: ウォームアップ処理 (ここから) ---
+    print("[INFO] Style-Bert-TTS (FT): Performing Warm-up (dummy inference)...")
+    try:
+        # 「あ」と一瞬だけ生成させて、CUDAの初期化コストをここで払っておく
+        # 結果は使わないので捨てる
+        _ = GLOBAL_TTS_MODEL.infer(
+            text="あ",
+            language=Languages.JP,
+            speaker_id=GLOBAL_SPEAKER_ID,
+            style="Neutral",
+            style_weight=0.7,
+            sdp_ratio=0.2,
+            noise=0.6,
+            noise_w=0.8,
+            length=0.1 # 最短で終わらせる
+        )
+        print("[INFO] Style-Bert-TTS (FT): Warm-up complete! (Ready for fast inference)")
+    except Exception as wu_e:
+        print(f"[WARNING] Warm-up failed (will proceed anyway): {wu_e}")
+    # --- ★追加: ウォームアップ処理 (ここまで) ---
     print("[INFO] Style-Bert-TTS (FT): All models ready.")
 
 except Exception as e:
@@ -144,6 +165,63 @@ def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str
         traceback.print_exc()
         return False
 
+import io
+from scipy.io.wavfile import write as scipy_write
+
+def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
+    """
+    音声をファイルに保存せず、バイトデータとして直接返す（Scipy高速化版）
+    """
+    if GLOBAL_TTS_MODEL is None or GLOBAL_SPEAKER_ID is None:
+        return None
+        
+    try:
+        # 1. 推論実行
+        sr, audio_data = GLOBAL_TTS_MODEL.infer(
+            text=text_to_speak,
+            language=Languages.JP,
+            speaker_id=GLOBAL_SPEAKER_ID,
+            style="Neutral",
+            style_weight=0.7,
+            sdp_ratio=0.2,
+            noise=0.6,
+            noise_w=0.8,
+            length=1.0
+        )
+        
+        # 2. 16bit PCMに変換 (正規化)
+        if audio_data.dtype != np.int16:
+            audio_norm = audio_data / np.abs(audio_data).max()
+            # floatのままリサンプリングするためにここではまだint16にしない
+            audio_float = audio_norm
+        else:
+            audio_float = audio_data.astype(np.float32) / 32768.0
+
+        # --- ★高速化ポイント: Scipyでリサンプリング (エラー回避版) ---
+        target_sr = 16000
+        if sr > target_sr:
+            # サンプル数を計算
+            num_samples = int(len(audio_float) * float(target_sr) / sr)
+            # Scipyでリサンプリング (librosaよりトラブルが少ない)
+            audio_resampled = scipy.signal.resample(audio_float, num_samples)
+            
+            # int16に変換
+            audio_int16 = (audio_resampled * 32767).astype(np.int16)
+            sr = target_sr
+        else:
+            # リサンプリング不要な場合
+            audio_int16 = (audio_float * 32767).astype(np.int16)
+        # -------------------------------------------------------
+        # 新しいコード（Raw PCM返却）:
+        # tobytes() でメモリ上の配列をそのままバイナリ化します
+        return audio_int16.tobytes()
+        
+
+    except Exception as e:
+        print(f"[ERROR] Memory Synthesis Error: {e}")
+        # エラー時はNoneを返すか、元のファイルを返すなど安全策をとる
+        return None
+    
 # --- 単体テスト (変更なし) ---
 if __name__ == "__main__":
     print("\n--- Style-Bert-TTS (FineTuned, FlatPath) 単体テスト ---")
