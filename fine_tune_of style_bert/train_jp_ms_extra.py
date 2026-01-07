@@ -1,5 +1,3 @@
-#損失を工夫
-
 import argparse
 import datetime
 import gc
@@ -25,16 +23,7 @@ from data_utils import (
     TextAudioSpeakerCollate,
     TextAudioSpeakerLoader,
 )
-# Modified imports to include new losses
-from losses import (
-    WavLMLoss,
-    discriminator_loss,
-    feature_loss,
-    generator_loss,
-    kl_loss,
-    mel_loss_with_sentence_end_weight,
-    delta_loss,
-)
+from losses import WavLMLoss, discriminator_loss, feature_loss, generator_loss, kl_loss
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons, utils
@@ -866,27 +855,13 @@ def train_and_evaluate(
             with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
                 loss_dur = torch.sum(l_length.float())
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                
-                # --- New Losses for Accent/End-of-sentence ---
-                loss_mel_end = mel_loss_with_sentence_end_weight(
-                    y_hat_mel, 
-                    y_mel, 
-                    lengths=spec_lengths, 
-                    start_indices=ids_slice, 
-                    end_weight=2.0, 
-                    end_ratio=0.2
-                ) * hps.train.c_mel  # Scale with same factor as mel loss
-                
-                loss_delta_val = delta_loss(y_hat_mel, y_mel, lengths=None) * hps.train.c_mel
-                # ---------------------------------------------
-
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
 
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 # loss_commit = loss_commit * hps.train.c_commit
 
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_mel_end + loss_delta_val
+                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
                 if net_dur_disc is not None:
                     loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
                     if net_wd is not None:
@@ -906,12 +881,12 @@ def train_and_evaluate(
             if global_step % hps.train.log_interval == 0 and not hps.speedup:
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
-                # logger.info(
-                #     "Train Epoch: {} [{:.0f}%]".format(
-                #         epoch, 100.0 * batch_idx / len(train_loader)
-                #     )
-                # )
-                # logger.info([x.item() for x in losses] + [global_step, lr])
+                logger.info(
+                   "Train Epoch: {} [{:.0f}%]".format(
+                        epoch, 100.0 * batch_idx / len(train_loader)
+                    )
+                )
+                logger.info([x.item() for x in losses] + [global_step, lr])
 
                 scalar_dict = {
                     "loss/g/total": loss_gen_all,
@@ -924,8 +899,6 @@ def train_and_evaluate(
                     {
                         "loss/g/fm": loss_fm,
                         "loss/g/mel": loss_mel,
-                        "loss/g/mel_end": loss_mel_end, # New log
-                        "loss/g/delta": loss_delta_val, # New log
                         "loss/g/dur": loss_dur,
                         "loss/g/kl": loss_kl,
                     }

@@ -40,6 +40,9 @@ Colab では通常 CUDA 12.x 環境なので cu118 → cu121 に変更してOK�
 
 ```python slice.py --model_name Ref_voice```
 
+注意: 短文の音声(2秒未満)は丸ごとカットされてしまいます。最短音声認識時間を短くしましょう。
+```!python slice.py --model_name Ref_voice --min_sec 1.0 --min_silence_dur_ms 1000```
+
 9. whisperで文字起こしをします
 
 ```pip install faster-whisper```
@@ -62,5 +65,6 @@ Colab では通常 CUDA 12.x 環境なので cu118 → cu121 に変更してOK�
 
 11. ファインチューニング
 ```python train_ms_jp_extra.py```
+
 
 Style-Bert-VITS2/model_assets/Ref_voiceに三つのファイルができています。これで完了です。
