@@ -23,7 +23,7 @@ QWEN3_DTYPE = os.getenv("QWEN3_DTYPE", "bfloat16")
 QWEN3_XVECTOR_ONLY = os.getenv("QWEN3_XVECTOR_ONLY", "0") == "1"
 
 DEFAULT_PARAMS = {
-    "instruct": "人間らしく、感情豊かに、自然な息遣いで話してください。",
+    "instruct": "人間らしく、感情豊かに、自然な息遣いで話してください。文末をはっきりと発音すること！",
     "do_sample": False,
     "temperature": 0.95,
     "top_p": 0.95,
