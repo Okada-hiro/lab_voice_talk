@@ -15,7 +15,7 @@ GLOBAL_VOICE_CLONE_PROMPT = None
 GLOBAL_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 # Environment-based configuration for easy deployment tuning.
-QWEN3_MODEL_PATH = os.getenv("QWEN3_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+QWEN3_MODEL_PATH = os.getenv("QWEN3_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 QWEN3_REF_AUDIO = os.getenv("QWEN3_REF_AUDIO", "")
 QWEN3_REF_TEXT = os.getenv("QWEN3_REF_TEXT", "")
 QWEN3_LANGUAGE = os.getenv("QWEN3_LANGUAGE", "Japanese")
