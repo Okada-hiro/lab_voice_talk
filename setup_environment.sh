@@ -3,7 +3,7 @@ set -e
 apt-get update
 apt-get install -y ffmpeg sox git build-essential ninja-build
 
-PY_VER="$(python -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')"
+PY_VER="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 if [ "${PY_VER}" != "3.10" ]; then
   echo "[WARN] Recommended Python is 3.10, current: ${PY_VER}"
 fi
