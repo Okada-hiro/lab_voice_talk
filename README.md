@@ -38,15 +38,14 @@ bash setup_environment.sh
 ```bash
 git clone https://github.com/ufal/whisper_streaming.git
 ```
-4. style_bert_vits2のクローンをしてください。
+4. ref_audio(参考音声)を指定してください。
 ```bash
-git clone https://github.com/litagin02/Style-Bert-VITS2.git
+export QWEN3_REF_AUDIO=ref_audio.WAV
 ```
 
-5. 名前の変更(-があると扱いづらい)と、__ init __.pyの作成をしてください。
+5. ref_text(参考テキスト)を指定してください。
 ```bash
-mv Style-Bert-VITS2 Style_Bert_VITS2
-touch Style_Bert_VITS2/__init__.py
+ export QWEN3_REF_TEXT="$(cat /workspace/lab_voice_talk/ref_text.txt)"
 ```
 6. ファインチューニング後のStyle-Bert-VITS2の重みを受け取ってください。
 ```bash

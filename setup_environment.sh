@@ -1,9 +1,17 @@
 set -e 
 
 apt-get update
-apt-get install -y ffmpeg
+apt-get install -y ffmpeg sox git build-essential ninja-build
 
-pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+PY_VER="$(python -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')"
+if [ "${PY_VER}" != "3.10" ]; then
+  echo "[WARN] Recommended Python is 3.10, current: ${PY_VER}"
+fi
+
+pip install -U pip setuptools wheel packaging psutil ninja
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+MAX_JOBS=4 pip install -U flash-attn==2.8.3 --no-build-isolation
+
 pip install faster-whisper==1.0.3
 pip install --force-reinstall ctranslate2==4.4.0
 
