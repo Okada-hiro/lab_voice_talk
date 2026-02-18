@@ -12,8 +12,8 @@ pip install -U pip setuptools wheel packaging psutil ninja
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 MAX_JOBS=4 pip install -U flash-attn==2.8.3 --no-build-isolation
 
-pip install faster-whisper==1.0.3
-pip install --force-reinstall ctranslate2==4.4.0
+pip uninstall -y ctranslate2 faster-whisper || true
+pip install -U ctranslate2 faster-whisper
 
 #-------------------------------------
 # 3. 音声系ライブラリ
