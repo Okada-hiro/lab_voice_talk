@@ -26,7 +26,11 @@ logger = logging.getLogger(__name__)
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from new_answer_generator import generate_answer_stream
-    from new_text_to_speech import synthesize_speech, synthesize_speech_to_memory
+    from new_text_to_speech import (
+        synthesize_speech,
+        synthesize_speech_to_memory,
+        synthesize_speech_to_memory_with_timing,
+    )
     from new_speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
@@ -229,13 +233,28 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 idx, phrase, enqueue_ts = item
                 queue_wait_ms = (time.perf_counter() - enqueue_ts) * 1000
                 tts_t0 = time.perf_counter()
-                full_wav_bytes = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
+                synth_t0 = time.perf_counter()
+                full_wav_bytes, synth_timing = await asyncio.to_thread(
+                    synthesize_speech_to_memory_with_timing, phrase
+                )
+                if full_wav_bytes is None:
+                    # Fallback for compatibility if timing API fails.
+                    full_wav_bytes = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
+                    synth_timing = {}
                 tts_ms = (time.perf_counter() - tts_t0) * 1000
                 tts_count += 1
                 tts_ms_sum += tts_ms
+                generate_ms = None if not synth_timing else synth_timing.get("generate_ms")
+                decode_ms = None if not synth_timing else synth_timing.get("decode_ms")
+                synth_total_ms = None if not synth_timing else synth_timing.get("total_ms")
+                extra_ms = (time.perf_counter() - synth_t0) * 1000
                 logger.info(
                     f"[LLM_TTS_TIMING] idx={idx} text_len={len(phrase)} "
-                    f"text_queue_wait_ms={queue_wait_ms:.1f} tts_ms={tts_ms:.1f}"
+                    f"text_queue_wait_ms={queue_wait_ms:.1f} tts_ms={tts_ms:.1f} "
+                    f"generate_ms={generate_ms if generate_ms is not None else 'NA'} "
+                    f"decode_ms={decode_ms if decode_ms is not None else 'NA'} "
+                    f"synth_total_ms={synth_total_ms if synth_total_ms is not None else 'NA'} "
+                    f"worker_total_ms={extra_ms:.1f}"
                 )
                 if full_wav_bytes:
                     await audio_queue.put((idx, full_wav_bytes, enqueue_ts))

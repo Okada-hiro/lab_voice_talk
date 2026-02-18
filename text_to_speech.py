@@ -1,8 +1,6 @@
 import os
 import io
 import traceback
-import threading
-import time
 
 import numpy as np
 import scipy.signal
@@ -15,7 +13,6 @@ from qwen_tts import Qwen3TTSModel
 GLOBAL_TTS_MODEL = None
 GLOBAL_VOICE_CLONE_PROMPT = None
 GLOBAL_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-GLOBAL_TTS_TIMING_LOCK = threading.Lock()
 
 # Environment-based configuration for easy deployment tuning.
 QWEN3_MODEL_PATH = os.getenv("QWEN3_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
@@ -87,63 +84,6 @@ def _generate_wav(text_to_speak: str, prompt_text: str = None):
     return np.asarray(wavs[0], dtype=np.float32), int(sr)
 
 
-def _generate_wav_with_timing(text_to_speak: str, prompt_text: str = None):
-    """
-    Return (wav, sr, timings_ms) where timings_ms includes:
-      - generate_ms: talker code generation
-      - decode_ms: codec-to-waveform decode
-      - total_ms: whole generate_voice_clone call
-    """
-    if GLOBAL_TTS_MODEL is None:
-        raise RuntimeError("Qwen3-TTS model is not initialized.")
-    if GLOBAL_VOICE_CLONE_PROMPT is None:
-        raise RuntimeError("Voice clone prompt is not initialized. Check QWEN3_REF_AUDIO/QWEN3_REF_TEXT.")
-
-    timings = {"generate_ms": None, "decode_ms": None, "total_ms": None}
-    instruct = prompt_text if prompt_text else DEFAULT_PARAMS["instruct"]
-
-    model_generate = GLOBAL_TTS_MODEL.model.generate
-    tokenizer_decode = GLOBAL_TTS_MODEL.model.speech_tokenizer.decode
-
-    def timed_model_generate(*args, **kwargs):
-        t0 = time.perf_counter()
-        out = model_generate(*args, **kwargs)
-        timings["generate_ms"] = (time.perf_counter() - t0) * 1000
-        return out
-
-    def timed_tokenizer_decode(*args, **kwargs):
-        t0 = time.perf_counter()
-        out = tokenizer_decode(*args, **kwargs)
-        timings["decode_ms"] = (time.perf_counter() - t0) * 1000
-        return out
-
-    with GLOBAL_TTS_TIMING_LOCK:
-        GLOBAL_TTS_MODEL.model.generate = timed_model_generate
-        GLOBAL_TTS_MODEL.model.speech_tokenizer.decode = timed_tokenizer_decode
-        try:
-            t0 = time.perf_counter()
-            wavs, sr = GLOBAL_TTS_MODEL.generate_voice_clone(
-                text=text_to_speak,
-                language=QWEN3_LANGUAGE,
-                instruct=instruct,
-                voice_clone_prompt=GLOBAL_VOICE_CLONE_PROMPT,
-                do_sample=DEFAULT_PARAMS["do_sample"],
-                temperature=DEFAULT_PARAMS["temperature"],
-                top_p=DEFAULT_PARAMS["top_p"],
-                top_k=DEFAULT_PARAMS["top_k"],
-                repetition_penalty=DEFAULT_PARAMS["repetition_penalty"],
-                max_new_tokens=DEFAULT_PARAMS["max_new_tokens"],
-            )
-            timings["total_ms"] = (time.perf_counter() - t0) * 1000
-        finally:
-            GLOBAL_TTS_MODEL.model.generate = model_generate
-            GLOBAL_TTS_MODEL.model.speech_tokenizer.decode = tokenizer_decode
-
-    if len(wavs) == 0:
-        raise RuntimeError("No waveform was generated.")
-    return np.asarray(wavs[0], dtype=np.float32), int(sr), timings
-
-
 def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str = None):
     try:
         wav, sr = _generate_wav(text_to_speak, prompt_text=prompt_text)
@@ -166,21 +106,6 @@ def synthesize_speech_to_memory(text_to_speak: str) -> bytes:
         print(f"[ERROR] Memory synthesis failed: {e}")
         traceback.print_exc()
         return None
-
-
-def synthesize_speech_to_memory_with_timing(text_to_speak: str):
-    """
-    Return (pcm16_bytes, timings_ms_dict) or (None, None) on failure.
-    """
-    try:
-        wav, sr, timings = _generate_wav_with_timing(text_to_speak, prompt_text=None)
-        wav = _resample_if_needed(wav, sr, DEFAULT_PARAMS["target_sr"])
-        pcm = _to_pcm16_bytes(wav)
-        return pcm, timings
-    except Exception as e:
-        print(f"[ERROR] Memory synthesis with timing failed: {e}")
-        traceback.print_exc()
-        return None, None
 
 
 try:
