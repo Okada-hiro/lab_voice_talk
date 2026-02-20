@@ -189,12 +189,17 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     llm_tts_start = time.perf_counter()
     TTS_WORKER_COUNT = 2
     TTS_PREFETCH_AHEAD = 1
-    STREAM_EMIT_EVERY_FRAMES = 8
-
-    if hasattr(tts_module, "DEFAULT_STREAM_PARAMS"):
-        tts_module.DEFAULT_STREAM_PARAMS["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
+    stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
     logger.info(
-        f"[TTS_CONFIG] emit_every_frames={STREAM_EMIT_EVERY_FRAMES} "
+        "[TTS_CONFIG] "
+        f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
+        f"decode_window_frames={stream_cfg.get('decode_window_frames')} "
+        f"overlap_samples={stream_cfg.get('overlap_samples')} "
+        f"first_chunk_emit_every={stream_cfg.get('first_chunk_emit_every')} "
+        f"first_chunk_decode_window={stream_cfg.get('first_chunk_decode_window')} "
+        f"first_chunk_frames={stream_cfg.get('first_chunk_frames')} "
+        f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
+        f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
         f"tts_workers={TTS_WORKER_COUNT} prefetch_ahead={TTS_PREFETCH_AHEAD}"
     )
 

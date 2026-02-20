@@ -38,10 +38,15 @@ DEFAULT_PARAMS = {
 }
 
 DEFAULT_STREAM_PARAMS = {
-    "emit_every_frames": 4,
+    "emit_every_frames": 8,
     "decode_window_frames": 80,
-    "overlap_samples": 0,
+    "overlap_samples": 512,
     "max_frames": 10000,
+    "first_chunk_emit_every": 0,
+    "first_chunk_decode_window": 48,
+    "first_chunk_frames": 48,
+    "repetition_penalty": 1.0,
+    "repetition_penalty_window": 100,
     "use_optimized_decode": True,
 }
 
@@ -200,6 +205,11 @@ def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = No
         decode_window_frames=DEFAULT_STREAM_PARAMS["decode_window_frames"],
         overlap_samples=DEFAULT_STREAM_PARAMS["overlap_samples"],
         max_frames=DEFAULT_STREAM_PARAMS["max_frames"],
+        first_chunk_emit_every=DEFAULT_STREAM_PARAMS["first_chunk_emit_every"],
+        first_chunk_decode_window=DEFAULT_STREAM_PARAMS["first_chunk_decode_window"],
+        first_chunk_frames=DEFAULT_STREAM_PARAMS["first_chunk_frames"],
+        repetition_penalty=DEFAULT_STREAM_PARAMS["repetition_penalty"],
+        repetition_penalty_window=DEFAULT_STREAM_PARAMS["repetition_penalty_window"],
         use_optimized_decode=DEFAULT_STREAM_PARAMS["use_optimized_decode"],
         do_sample=DEFAULT_PARAMS["do_sample"],
         temperature=DEFAULT_PARAMS["temperature"],

@@ -29,9 +29,10 @@ pip install fastapi uvicorn[standard] google-generativeai openai huggingface_hub
 #    - Install streaming-enabled qwen_tts as active package
 # -------------------------------------
 WORKDIR="${WORKDIR:-/workspace}"
+QWEN3_TTS_STREAMING_REPO="${QWEN3_TTS_STREAMING_REPO:-https://github.com/rekuenkdr/Qwen3-TTS-streaming.git}"
 mkdir -p "${WORKDIR}"
 if [ ! -d "${WORKDIR}/Qwen3-TTS-streaming" ]; then
-  git clone https://github.com/dffdeeq/Qwen3-TTS-streaming.git "${WORKDIR}/Qwen3-TTS-streaming"
+  git clone "${QWEN3_TTS_STREAMING_REPO}" "${WORKDIR}/Qwen3-TTS-streaming"
 fi
 
 pip uninstall -y qwen-tts qwen_tts || true
