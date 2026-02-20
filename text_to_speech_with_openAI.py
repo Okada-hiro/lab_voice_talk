@@ -16,7 +16,7 @@ OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")
 OPENAI_TTS_RESPONSE_FORMAT = os.getenv("OPENAI_TTS_RESPONSE_FORMAT", "pcm")
 OPENAI_TTS_SAMPLE_RATE = int(os.getenv("OPENAI_TTS_SAMPLE_RATE", "24000"))
 OPENAI_TTS_STYLE = os.getenv("OPENAI_TTS_STYLE", "calm")
-OPENAI_TTS_BYTE_CHUNK = int(os.getenv("OPENAI_TTS_BYTE_CHUNK", "4096"))
+OPENAI_TTS_BYTE_CHUNK = int(os.getenv("OPENAI_TTS_BYTE_CHUNK", "8192"))
 
 _client: Optional[OpenAI] = None
 
@@ -60,13 +60,19 @@ def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = No
         pending = bytearray()
         for chunk in _iter_openai_pcm_chunks(text_to_speak, prompt_text=prompt_text):
             pending.extend(chunk)
+            # PCM16は2バイト境界が必須。奇数バイトは次チャンクへ持ち越す。
             while len(pending) >= OPENAI_TTS_BYTE_CHUNK:
-                out = bytes(pending[:OPENAI_TTS_BYTE_CHUNK])
-                del pending[:OPENAI_TTS_BYTE_CHUNK]
+                candidate = OPENAI_TTS_BYTE_CHUNK
+                if candidate % 2 == 1:
+                    candidate -= 1
+                out = bytes(pending[:candidate])
+                del pending[:candidate]
                 yield out
 
-        if pending:
-            yield bytes(pending)
+        # 末尾も2バイト境界までのみ返す（端数1バイトは破棄）
+        tail_usable = len(pending) - (len(pending) % 2)
+        if tail_usable > 0:
+            yield bytes(pending[:tail_usable])
 
     except Exception as e:
         print(f"[ERROR] OpenAI stream synthesis failed: {e}")
@@ -83,7 +89,9 @@ def synthesize_speech_to_memory(text_to_speak: str) -> Optional[bytes]:
         parts = []
         for chunk in _iter_openai_pcm_chunks(text_to_speak, prompt_text=None):
             parts.append(chunk)
-        return b"".join(parts)
+        joined = b"".join(parts)
+        usable = len(joined) - (len(joined) % 2)
+        return joined[:usable]
     except Exception as e:
         print(f"[ERROR] OpenAI memory synthesis failed: {e}")
         traceback.print_exc()
@@ -97,6 +105,7 @@ def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str
     """
     try:
         pcm = b"".join(_iter_openai_pcm_chunks(text_to_speak, prompt_text=prompt_text))
+        pcm = pcm[: len(pcm) - (len(pcm) % 2)]
         if not pcm:
             raise RuntimeError("No audio bytes were generated.")
 
