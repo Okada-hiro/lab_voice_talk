@@ -1,4 +1,3 @@
-#今はこれ！ 2月20日 一旦安定する
 import os
 import io
 import traceback
@@ -17,6 +16,7 @@ GLOBAL_TTS_MODEL = None
 GLOBAL_VOICE_CLONE_PROMPT = None
 GLOBAL_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 GLOBAL_TTS_TIMING_LOCK = threading.Lock()
+GLOBAL_FRAME_RATE_HZ = None
 
 # Environment-based configuration for easy deployment tuning.
 QWEN3_MODEL_PATH = os.getenv("QWEN3_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
@@ -59,6 +59,35 @@ def _resolve_dtype(name: str):
     if key == "float16":
         return torch.float16
     return torch.float32
+
+
+def _infer_frame_rate_hz() -> float:
+    try:
+        st = GLOBAL_TTS_MODEL.model.speech_tokenizer
+        for attr in ("get_encode_frame_rate", "get_frame_rate"):
+            fn = getattr(st, attr, None)
+            if callable(fn):
+                v = float(fn())
+                if v > 0:
+                    return v
+        for attr in ("encode_frame_rate", "frame_rate"):
+            v = getattr(st, attr, None)
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+    except Exception:
+        pass
+
+    model_path = str(QWEN3_MODEL_PATH).lower()
+    if "25hz" in model_path:
+        return 25.0
+    return 12.0
+
+
+def _estimate_tokens_from_audio_len(num_samples: int, sample_rate: int, frame_rate_hz: float) -> int:
+    if sample_rate <= 0 or frame_rate_hz <= 0:
+        return 0
+    duration_sec = float(num_samples) / float(sample_rate)
+    return int(round(duration_sec * frame_rate_hz))
 
 
 def _to_pcm16_bytes(audio: np.ndarray) -> bytes:
@@ -113,7 +142,7 @@ def _generate_wav_with_timing(text_to_speak: str, prompt_text: str = None):
     if GLOBAL_VOICE_CLONE_PROMPT is None:
         raise RuntimeError("Voice clone prompt is not initialized. Check QWEN3_REF_AUDIO/QWEN3_REF_TEXT.")
 
-    timings = {"generate_ms": None, "decode_ms": None, "total_ms": None}
+    timings = {"generate_ms": None, "decode_ms": None, "total_ms": None, "generated_tokens": None}
     instruct = prompt_text if prompt_text else DEFAULT_PARAMS["instruct"]
 
     model_generate = GLOBAL_TTS_MODEL.model.generate
@@ -123,6 +152,12 @@ def _generate_wav_with_timing(text_to_speak: str, prompt_text: str = None):
         t0 = time.perf_counter()
         out = model_generate(*args, **kwargs)
         timings["generate_ms"] = (time.perf_counter() - t0) * 1000
+        try:
+            talker_codes_list = out[0]
+            if talker_codes_list and len(talker_codes_list) > 0:
+                timings["generated_tokens"] = int(talker_codes_list[0].shape[0])
+        except Exception:
+            pass
         return out
 
     def timed_tokenizer_decode(*args, **kwargs):
@@ -218,14 +253,33 @@ def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = No
         top_k=DEFAULT_PARAMS["top_k"],
     )
 
+    stream_start = time.perf_counter()
+    total_samples = 0
+    total_bytes = 0
+    chunk_count = 0
+    src_sr_last = 0
     for wav_chunk, sr in chunk_iter:
         wav_chunk = np.asarray(wav_chunk, dtype=np.float32)
         if wav_chunk.size == 0:
             continue
+        chunk_count += 1
+        total_samples += int(wav_chunk.shape[0])
+        src_sr_last = int(sr)
         wav_chunk = _resample_if_needed(wav_chunk, int(sr), DEFAULT_PARAMS["target_sr"])
         pcm = _to_pcm16_bytes(wav_chunk)
         if pcm:
+            total_bytes += len(pcm)
             yield pcm
+    elapsed_ms = (time.perf_counter() - stream_start) * 1000.0
+    est_tokens = _estimate_tokens_from_audio_len(
+        total_samples, src_sr_last, GLOBAL_FRAME_RATE_HZ if GLOBAL_FRAME_RATE_HZ else 0.0
+    )
+    print(
+        "[TTS_LOG] stream_summary "
+        f"text_len={len(text_to_speak)} chunks={chunk_count} total_bytes={total_bytes} "
+        f"elapsed_ms={elapsed_ms:.1f} estimated_tokens={est_tokens} "
+        f"frame_rate_hz={GLOBAL_FRAME_RATE_HZ} max_frames_budget={DEFAULT_STREAM_PARAMS.get('max_frames')}"
+    )
 
 
 def synthesize_speech_to_memory_with_timing(text_to_speak: str):
@@ -236,6 +290,14 @@ def synthesize_speech_to_memory_with_timing(text_to_speak: str):
         wav, sr, timings = _generate_wav_with_timing(text_to_speak, prompt_text=None)
         wav = _resample_if_needed(wav, sr, DEFAULT_PARAMS["target_sr"])
         pcm = _to_pcm16_bytes(wav)
+        est_tokens = _estimate_tokens_from_audio_len(len(wav), sr, GLOBAL_FRAME_RATE_HZ if GLOBAL_FRAME_RATE_HZ else 0.0)
+        print(
+            "[TTS_LOG] non_stream_summary "
+            f"text_len={len(text_to_speak)} generated_tokens={timings.get('generated_tokens')} "
+            f"estimated_tokens={est_tokens} generate_ms={timings.get('generate_ms')} "
+            f"decode_ms={timings.get('decode_ms')} total_ms={timings.get('total_ms')} "
+            f"max_new_tokens={DEFAULT_PARAMS.get('max_new_tokens')} frame_rate_hz={GLOBAL_FRAME_RATE_HZ}"
+        )
         return pcm, timings
     except Exception as e:
         print(f"[ERROR] Memory synthesis with timing failed: {e}")
@@ -256,6 +318,15 @@ try:
         raise ValueError("QWEN3_REF_AUDIO is empty. Set reference audio path for voice cloning.")
     if (not QWEN3_XVECTOR_ONLY) and (not QWEN3_REF_TEXT):
         raise ValueError("QWEN3_REF_TEXT is empty. Set transcript or enable QWEN3_XVECTOR_ONLY=1.")
+
+    GLOBAL_FRAME_RATE_HZ = _infer_frame_rate_hz()
+    print(
+        "[TTS_LOG] init "
+        f"frame_rate_hz={GLOBAL_FRAME_RATE_HZ} "
+        f"max_new_tokens={DEFAULT_PARAMS.get('max_new_tokens')} "
+        f"stream_max_frames={DEFAULT_STREAM_PARAMS.get('max_frames')} "
+        f"emit_every_frames={DEFAULT_STREAM_PARAMS.get('emit_every_frames')}"
+    )
 
     print("[INFO] Qwen3-TTS: creating reusable voice clone prompt...")
     GLOBAL_VOICE_CLONE_PROMPT = GLOBAL_TTS_MODEL.create_voice_clone_prompt(

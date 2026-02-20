@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from new_answer_generator import generate_answer_stream
-    import new_text_to_speech as tts_module
-    from new_text_to_speech import (
+    import new_text_to_speech_qwen3tts_streaming as tts_module
+    from new_text_to_speech_qwen3tts_streaming import (
         synthesize_speech,
         synthesize_speech_to_memory,
         synthesize_speech_to_memory_stream,
