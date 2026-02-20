@@ -294,22 +294,18 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
 
     async def audio_sender_worker():
         nonlocal first_audio_sent_at
-        expected_sentence_idx = 1
-        sentence_buffers = {}
-
-        async def flush_ready_sentences():
-            nonlocal expected_sentence_idx, first_audio_sent_at
-            while True:
-                buf = sentence_buffers.get(expected_sentence_idx)
-                if buf is None:
+        while True:
+            item = await audio_queue.get()
+            try:
+                if item.get("type") == "stop":
                     return
 
-                while buf["next_chunk_to_send"] in buf["chunks"]:
-                    tts_chunk_idx = buf["next_chunk_to_send"]
-                    chunk_item = buf["chunks"].pop(tts_chunk_idx)
-                    audio_bytes = chunk_item["audio_bytes"]
+                if item["type"] == "chunk":
+                    idx = item["sentence_idx"]
+                    tts_chunk_idx = item["tts_chunk_idx"]
+                    audio_bytes = item["audio_bytes"]
                     send_start = time.perf_counter()
-                    queue_to_send_ms = (send_start - chunk_item["created_at"]) * 1000.0
+                    queue_to_send_ms = (send_start - item["created_at"]) * 1000.0
                     offset = 0
                     ws_chunk_count = 0
                     while offset < len(audio_bytes):
@@ -326,57 +322,18 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         logger.info(f"[TTS_TIMING] first_audio_sent_ms={first_audio_ms:.1f}")
 
                     logger.info(
-                        f"[TTS_TIMING] worker={chunk_item['worker_id']} sentence={expected_sentence_idx} "
+                        f"[TTS_TIMING] worker={item['worker_id']} sentence={idx} "
                         f"tts_chunk={tts_chunk_idx} stage=send chunk_bytes={len(audio_bytes)} "
                         f"ws_chunks={ws_chunk_count} queue_to_send_ms={queue_to_send_ms:.1f} send_ms={send_ms:.1f}"
                     )
-                    buf["next_chunk_to_send"] += 1
-
-                if buf["done"] and buf["next_chunk_to_send"] > buf["last_tts_chunk_idx"]:
-                    logger.info(
-                        f"🚀 Streamed audio {expected_sentence_idx} (Total: {buf['total_bytes']} bytes) "
-                        f"[TTS_TIMING] queue_wait_ms={buf.get('queue_wait_ms', 0.0):.1f} "
-                        f"first_chunk_ready_ms={buf.get('first_chunk_ready_ms', 0.0) or 0.0:.1f} "
-                        f"total_tts_ms={buf.get('total_tts_ms', 0.0):.1f} "
-                        f"tts_chunk_count={buf['last_tts_chunk_idx']}"
-                    )
-                    sentence_buffers.pop(expected_sentence_idx, None)
-                    expected_sentence_idx += 1
-                    continue
-                return
-
-        while True:
-            item = await audio_queue.get()
-            try:
-                if item.get("type") == "stop":
-                    await flush_ready_sentences()
-                    return
-
-                idx = item["sentence_idx"]
-                if idx not in sentence_buffers:
-                    sentence_buffers[idx] = {
-                        "chunks": {},
-                        "next_chunk_to_send": 1,
-                        "done": False,
-                        "last_tts_chunk_idx": 0,
-                        "total_bytes": 0,
-                        "queue_wait_ms": 0.0,
-                        "first_chunk_ready_ms": 0.0,
-                        "total_tts_ms": 0.0,
-                    }
-
-                buf = sentence_buffers[idx]
-                if item["type"] == "chunk":
-                    buf["chunks"][item["tts_chunk_idx"]] = item
                 elif item["type"] == "done":
-                    buf["done"] = True
-                    buf["last_tts_chunk_idx"] = item["tts_chunk_idx"]
-                    buf["total_bytes"] = item.get("total_bytes", 0)
-                    buf["queue_wait_ms"] = item.get("queue_wait_ms", 0.0)
-                    buf["first_chunk_ready_ms"] = item.get("first_chunk_ready_ms", 0.0) or 0.0
-                    buf["total_tts_ms"] = item.get("total_tts_ms", 0.0)
-
-                await flush_ready_sentences()
+                    logger.info(
+                        f"🚀 Streamed audio {item['sentence_idx']} (Total: {item.get('total_bytes', 0)} bytes) "
+                        f"[TTS_TIMING] queue_wait_ms={item.get('queue_wait_ms', 0.0):.1f} "
+                        f"first_chunk_ready_ms={item.get('first_chunk_ready_ms', 0.0) or 0.0:.1f} "
+                        f"total_tts_ms={item.get('total_tts_ms', 0.0):.1f} "
+                        f"tts_chunk_count={item.get('tts_chunk_idx', 0)}"
+                    )
             finally:
                 audio_queue.task_done()
 
