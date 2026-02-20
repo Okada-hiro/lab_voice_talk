@@ -11,13 +11,6 @@ import torch
 
 from qwen_tts import Qwen3TTSModel
 
-torch.set_float32_matmul_precision("high")
-if torch.cuda.is_available():
-    try:
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-    except Exception:
-        pass
 
 GLOBAL_TTS_MODEL = None
 GLOBAL_VOICE_CLONE_PROMPT = None
@@ -65,39 +58,6 @@ def _resolve_dtype(name: str):
     if key == "float16":
         return torch.float16
     return torch.float32
-
-
-def _enable_runtime_optimizations():
-    """
-    Explicitly enable runtime options for lower kernel overhead on L4-class GPUs.
-    """
-    if GLOBAL_TTS_MODEL is None:
-        return
-
-    try:
-        GLOBAL_TTS_MODEL.model.config.use_cache = True
-    except Exception as e:
-        print(f"[WARN] Failed to set model.config.use_cache=True: {e}")
-
-    try:
-        if hasattr(GLOBAL_TTS_MODEL.model, "generation_config") and GLOBAL_TTS_MODEL.model.generation_config is not None:
-            GLOBAL_TTS_MODEL.model.generation_config.cache_implementation = "static"
-    except Exception as e:
-        print(f"[WARN] Failed to set generation_config.cache_implementation='static': {e}")
-
-    try:
-        GLOBAL_TTS_MODEL.enable_streaming_optimizations(
-            decode_window_frames=DEFAULT_STREAM_PARAMS["decode_window_frames"],
-            use_compile=True,
-            use_cuda_graphs=False,
-            compile_mode="reduce-overhead",
-            use_fast_codebook=False,
-            compile_codebook_predictor=True,
-            compile_talker=True,
-        )
-        print("[INFO] Qwen3-TTS runtime optimizations enabled (compile/cache/static).")
-    except Exception as e:
-        print(f"[WARN] Failed to enable streaming optimizations: {e}")
 
 
 def _to_pcm16_bytes(audio: np.ndarray) -> bytes:
@@ -295,8 +255,6 @@ try:
         raise ValueError("QWEN3_REF_AUDIO is empty. Set reference audio path for voice cloning.")
     if (not QWEN3_XVECTOR_ONLY) and (not QWEN3_REF_TEXT):
         raise ValueError("QWEN3_REF_TEXT is empty. Set transcript or enable QWEN3_XVECTOR_ONLY=1.")
-
-    _enable_runtime_optimizations()
 
     print("[INFO] Qwen3-TTS: creating reusable voice clone prompt...")
     GLOBAL_VOICE_CLONE_PROMPT = GLOBAL_TTS_MODEL.create_voice_clone_prompt(
