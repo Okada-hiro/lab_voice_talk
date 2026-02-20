@@ -1,105 +1,119 @@
-import argparse
+import io
 import os
+import traceback
+from typing import Iterator, Optional
 
 import numpy as np
-import sounddevice as sd
 import soundfile as sf
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 
 
-DEFAULT_TEXT = "お電話ありがとうございます。事故のご連絡ですね。私が対応いたします。"
+load_dotenv()
+
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")
+OPENAI_TTS_FORMAT = os.getenv("OPENAI_TTS_FORMAT", "pcm16")
+OPENAI_TTS_SAMPLE_RATE = int(os.getenv("OPENAI_TTS_SAMPLE_RATE", "16000"))
+OPENAI_TTS_SPEED = float(os.getenv("OPENAI_TTS_SPEED", "0.95"))
+OPENAI_TTS_PITCH = float(os.getenv("OPENAI_TTS_PITCH", "0.3"))
+OPENAI_TTS_STYLE = os.getenv("OPENAI_TTS_STYLE", "calm")
+OPENAI_TTS_BYTE_CHUNK = int(os.getenv("OPENAI_TTS_BYTE_CHUNK", "4096"))
+
+_client: Optional[OpenAI] = None
 
 
-def stream_tts_openai(
-    text: str,
-    model: str = "gpt-4o-mini-tts",
-    voice: str = "marin",
-    sample_rate: int = 24000,
-    speed: float = 0.95,
-    pitch: float = 0.3,
-    style: str = "calm",
-    output_path: str | None = "openai_tts_out.wav",
-) -> None:
-    load_dotenv()
+def _get_client() -> OpenAI:
+    global _client
+    if _client is not None:
+        return _client
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError(
             "OPENAI_API_KEY is not set. "
             "Set it with: export OPENAI_API_KEY='your_api_key'"
         )
+    _client = OpenAI(api_key=api_key)
+    return _client
 
-    client = OpenAI(api_key=api_key)
 
-    stream = None
-    can_play = True
+def _iter_openai_pcm_chunks(text_to_speak: str, prompt_text: str = None) -> Iterator[bytes]:
+    client = _get_client()
+    style = prompt_text if prompt_text else OPENAI_TTS_STYLE
+
+    with client.audio.speech.with_streaming_response.create(
+        model=OPENAI_TTS_MODEL,
+        voice=OPENAI_TTS_VOICE,
+        input=text_to_speak,
+        format=OPENAI_TTS_FORMAT,
+        sample_rate=OPENAI_TTS_SAMPLE_RATE,
+        speed=OPENAI_TTS_SPEED,
+        pitch=OPENAI_TTS_PITCH,
+        style=style,
+    ) as response:
+        for chunk in response.iter_bytes():
+            if chunk:
+                yield chunk
+
+
+def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = None):
+    """
+    new_text_to_speech.py と同じ役割:
+    PCM16 bytes を逐次 yield する。
+    """
     try:
-        stream = sd.OutputStream(
-            samplerate=sample_rate,
-            channels=1,
-            dtype="int16",
-        )
-        stream.start()
+        pending = bytearray()
+        for chunk in _iter_openai_pcm_chunks(text_to_speak, prompt_text=prompt_text):
+            pending.extend(chunk)
+            while len(pending) >= OPENAI_TTS_BYTE_CHUNK:
+                out = bytes(pending[:OPENAI_TTS_BYTE_CHUNK])
+                del pending[:OPENAI_TTS_BYTE_CHUNK]
+                yield out
+
+        if pending:
+            yield bytes(pending)
+
     except Exception as e:
-        can_play = False
-        print(f"[WARN] Audio device unavailable. Fallback to file output only: {e}")
+        print(f"[ERROR] OpenAI stream synthesis failed: {e}")
+        traceback.print_exc()
+        return
 
-    collected = []
+
+def synthesize_speech_to_memory(text_to_speak: str) -> Optional[bytes]:
+    """
+    new_text_to_speech.py と同じ役割:
+    一括PCM16 bytesを返す。
+    """
     try:
-        with client.audio.speech.with_streaming_response.create(
-            model=model,
-            voice=voice,
-            input=text,
-            format="pcm16",
-            sample_rate=sample_rate,
-            speed=speed,
-            pitch=pitch,
-            style=style,
-        ) as response:
-            for chunk in response.iter_bytes():
-                if not chunk:
-                    continue
-                audio = np.frombuffer(chunk, dtype=np.int16)
-                collected.append(audio.copy())
-                if can_play and stream is not None:
-                    stream.write(audio)
-    finally:
-        if stream is not None:
-            stream.stop()
-            stream.close()
-
-    if output_path and collected:
-        pcm = np.concatenate(collected)
-        sf.write(output_path, pcm, sample_rate, subtype="PCM_16")
-        print(f"[INFO] Saved audio: {output_path}")
+        parts = []
+        for chunk in _iter_openai_pcm_chunks(text_to_speak, prompt_text=None):
+            parts.append(chunk)
+        return b"".join(parts)
+    except Exception as e:
+        print(f"[ERROR] OpenAI memory synthesis failed: {e}")
+        traceback.print_exc()
+        return None
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="OpenAI TTS streaming playback")
-    parser.add_argument("--text", default=os.getenv("OPENAI_TTS_TEXT", DEFAULT_TEXT))
-    parser.add_argument("--model", default=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"))
-    parser.add_argument("--voice", default=os.getenv("OPENAI_TTS_VOICE", "marin"))
-    parser.add_argument("--sample-rate", type=int, default=int(os.getenv("OPENAI_TTS_SAMPLE_RATE", "24000")))
-    parser.add_argument("--speed", type=float, default=float(os.getenv("OPENAI_TTS_SPEED", "0.95")))
-    parser.add_argument("--pitch", type=float, default=float(os.getenv("OPENAI_TTS_PITCH", "0.3")))
-    parser.add_argument("--style", default=os.getenv("OPENAI_TTS_STYLE", "calm"))
-    parser.add_argument("--output", default=os.getenv("OPENAI_TTS_OUTPUT", "openai_tts_out.wav"))
-    return parser.parse_args()
+def synthesize_speech(text_to_speak: str, output_wav_path: str, prompt_text: str = None) -> bool:
+    """
+    new_text_to_speech.py と同じ役割:
+    音声ファイル保存。
+    """
+    try:
+        pcm = b"".join(_iter_openai_pcm_chunks(text_to_speak, prompt_text=prompt_text))
+        if not pcm:
+            raise RuntimeError("No audio bytes were generated.")
 
+        audio_i16 = np.frombuffer(pcm, dtype=np.int16)
+        audio_f32 = audio_i16.astype(np.float32) / 32768.0
 
-def main() -> None:
-    args = _parse_args()
-    stream_tts_openai(
-        text=args.text,
-        model=args.model,
-        voice=args.voice,
-        sample_rate=args.sample_rate,
-        speed=args.speed,
-        pitch=args.pitch,
-        style=args.style,
-        output_path=args.output,
-    )
-
-
-if __name__ == "__main__":
-    main()
+        os.makedirs(os.path.dirname(output_wav_path) or ".", exist_ok=True)
+        sf.write(output_wav_path, audio_f32, OPENAI_TTS_SAMPLE_RATE)
+        print(f"[SUCCESS] Saved to {output_wav_path}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] OpenAI file synthesis failed: {e}")
+        traceback.print_exc()
+        return False
