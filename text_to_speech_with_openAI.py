@@ -22,6 +22,7 @@ OPENAI_TTS_INSTRUCTIONS = os.getenv(
     (
         "polite Japanese customer support agent, "
         "calm, clear pronunciation, consistent speaking rate, "
+        "slightly higher pitch than normal,"
         "slightly slow, neutral emotion"
     ),
 )

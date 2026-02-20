@@ -534,6 +534,10 @@ async def get_root():
             let isPlaying = false;
             let currentSourceNode = null;
             let currentAiBubble = null;
+            const TTS_SAMPLE_RATE = 24000;
+            const PLAYBACK_START_BUFFER_MS = 300;
+            let queuedSamples = 0;
+            let streamCompleted = false;
             
             // ★「今後表示しない」設定
             let muteUnregisteredWarning = false;
@@ -636,6 +640,7 @@ async def get_root():
                     socket.onmessage = async (event) => {
                         if (event.data instanceof ArrayBuffer) {
                             audioQueue.push(event.data);
+                            queuedSamples += (event.data.byteLength / 2); // PCM16 mono
                             processAudioQueue();
                         } else {
                             const data = JSON.parse(event.data);
@@ -679,6 +684,8 @@ async def get_root():
                                 }
                                 currentAiBubble = null;
                                 statusDiv.textContent = "🎙️ 準備OK";
+                                streamCompleted = true;
+                                processAudioQueue();
                             }
                         }
                     };
@@ -717,6 +724,8 @@ async def get_root():
                 if (currentSourceNode) { try { currentSourceNode.stop(); } catch(e){} currentSourceNode = null; }
                 audioQueue = [];
                 isPlaying = false;
+                queuedSamples = 0;
+                streamCompleted = false;
             }
 
             // ★追加: 再生時間を管理する変数
@@ -727,9 +736,18 @@ async def get_root():
                     isPlaying = false;
                     return;
                 }
+
+                // 300ms分たまるまで再生開始を待つ（ただしストリーム完了時は再生する）
+                if (!isPlaying) {
+                    const queuedMs = (queuedSamples / TTS_SAMPLE_RATE) * 1000;
+                    if (!streamCompleted && queuedMs < PLAYBACK_START_BUFFER_MS) {
+                        return;
+                    }
+                }
                 
                 isPlaying = true;
                 const rawBytes = audioQueue.shift();
+                queuedSamples = Math.max(0, queuedSamples - (rawBytes.byteLength / 2));
                 
                 try {
                     if (audioContext.state === 'suspended') {
@@ -752,7 +770,7 @@ async def get_root():
 
                     // 3. 再生用バッファを作成 (モノラル, 長さ, 24000Hz)
                     // ※text_to_speech_with_openAI.py の sample_rate と合わせる必要があります
-                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, 24000);
+                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, TTS_SAMPLE_RATE);
                     
                     // 4. データをバッファにコピー
                     audioBuffer.getChannelData(0).set(float32Data);
