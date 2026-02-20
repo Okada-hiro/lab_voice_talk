@@ -17,6 +17,14 @@ OPENAI_TTS_RESPONSE_FORMAT = os.getenv("OPENAI_TTS_RESPONSE_FORMAT", "pcm")
 OPENAI_TTS_SAMPLE_RATE = int(os.getenv("OPENAI_TTS_SAMPLE_RATE", "24000"))
 OPENAI_TTS_STYLE = os.getenv("OPENAI_TTS_STYLE", "calm")
 OPENAI_TTS_BYTE_CHUNK = int(os.getenv("OPENAI_TTS_BYTE_CHUNK", "8192"))
+OPENAI_TTS_INSTRUCTIONS = os.getenv(
+    "OPENAI_TTS_INSTRUCTIONS",
+    (
+        "polite Japanese customer support agent, "
+        "calm, clear pronunciation, consistent speaking rate, "
+        "slightly slow, neutral emotion"
+    ),
+)
 
 _client: Optional[OpenAI] = None
 
@@ -38,12 +46,14 @@ def _get_client() -> OpenAI:
 
 def _iter_openai_pcm_chunks(text_to_speak: str, prompt_text: str = None) -> Iterator[bytes]:
     client = _get_client()
-    _ = prompt_text if prompt_text else OPENAI_TTS_STYLE
+    _ = OPENAI_TTS_STYLE
+    instructions = prompt_text if prompt_text else OPENAI_TTS_INSTRUCTIONS
 
     with client.audio.speech.with_streaming_response.create(
         model=OPENAI_TTS_MODEL,
         voice=OPENAI_TTS_VOICE,
         input=text_to_speak,
+        instructions=instructions,
         response_format=OPENAI_TTS_RESPONSE_FORMAT,
     ) as response:
         for chunk in response.iter_bytes():
