@@ -187,8 +187,8 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
 
     iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
-    # 16kHz / PCM16 / mono を維持しつつ、20ms単位で細かく送る
-    SAMPLE_RATE = 16000
+    # TTS出力(PCM16 / mono)を20ms単位で細かく送る
+    SAMPLE_RATE = 24000
     BYTES_PER_SAMPLE = 2
     FRAME_MS = 20
     CHUNK_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * FRAME_MS // 1000
@@ -689,7 +689,7 @@ async def get_root():
             }
 
             async function initAudioStream() {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
                 sourceInput = audioContext.createMediaStreamSource(stream);
                 processor = audioContext.createScriptProcessor(512, 1, 1);
@@ -750,9 +750,9 @@ async def get_root():
                         float32Data[i] = int16Data[i] / 32768.0;
                     }
 
-                    // 3. 再生用バッファを作成 (モノラル, 長さ, 16000Hz)
-                    // ※text_to_speech_with_openAI.py の sample_rate と合わせる必要があります(今は16000推奨)
-                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, 16000);
+                    // 3. 再生用バッファを作成 (モノラル, 長さ, 24000Hz)
+                    // ※text_to_speech_with_openAI.py の sample_rate と合わせる必要があります
+                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, 24000);
                     
                     // 4. データをバッファにコピー
                     audioBuffer.getChannelData(0).set(float32Data);
