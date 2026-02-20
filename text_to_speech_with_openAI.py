@@ -13,10 +13,8 @@ load_dotenv()
 
 OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")
-OPENAI_TTS_FORMAT = os.getenv("OPENAI_TTS_FORMAT", "pcm16")
+OPENAI_TTS_RESPONSE_FORMAT = os.getenv("OPENAI_TTS_RESPONSE_FORMAT", "pcm16")
 OPENAI_TTS_SAMPLE_RATE = int(os.getenv("OPENAI_TTS_SAMPLE_RATE", "16000"))
-OPENAI_TTS_SPEED = float(os.getenv("OPENAI_TTS_SPEED", "0.95"))
-OPENAI_TTS_PITCH = float(os.getenv("OPENAI_TTS_PITCH", "0.3"))
 OPENAI_TTS_STYLE = os.getenv("OPENAI_TTS_STYLE", "calm")
 OPENAI_TTS_BYTE_CHUNK = int(os.getenv("OPENAI_TTS_BYTE_CHUNK", "4096"))
 
@@ -40,17 +38,13 @@ def _get_client() -> OpenAI:
 
 def _iter_openai_pcm_chunks(text_to_speak: str, prompt_text: str = None) -> Iterator[bytes]:
     client = _get_client()
-    style = prompt_text if prompt_text else OPENAI_TTS_STYLE
+    _ = prompt_text if prompt_text else OPENAI_TTS_STYLE
 
     with client.audio.speech.with_streaming_response.create(
         model=OPENAI_TTS_MODEL,
         voice=OPENAI_TTS_VOICE,
         input=text_to_speak,
-        response_format=OPENAI_TTS_FORMAT,
-        sample_rate=OPENAI_TTS_SAMPLE_RATE,
-        speed=OPENAI_TTS_SPEED,
-        pitch=OPENAI_TTS_PITCH,
-        style=style,
+        response_format=OPENAI_TTS_RESPONSE_FORMAT,
     ) as response:
         for chunk in response.iter_bytes():
             if chunk:
