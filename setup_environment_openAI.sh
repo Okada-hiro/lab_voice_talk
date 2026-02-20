@@ -16,3 +16,5 @@ pip install -U openai numpy sounddevice soundfile scipy
 pip install -U fastapi "uvicorn[standard]" websockets python-dotenv loguru
 
 echo "[INFO] OpenAI environment setup completed."
+echo "[INFO] Set your API key before running:"
+echo "       export OPENAI_API_KEY='your_api_key'"

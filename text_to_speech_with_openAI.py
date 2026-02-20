@@ -4,6 +4,7 @@ import os
 import numpy as np
 import sounddevice as sd
 from openai import OpenAI
+from dotenv import load_dotenv
 
 
 DEFAULT_TEXT = "お電話ありがとうございます。事故のご連絡ですね。私が対応いたします。"
@@ -18,7 +19,15 @@ def stream_tts_openai(
     pitch: float = 0.3,
     style: str = "calm",
 ) -> None:
-    client = OpenAI()
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. "
+            "Set it with: export OPENAI_API_KEY='your_api_key'"
+        )
+
+    client = OpenAI(api_key=api_key)
 
     stream = sd.OutputStream(
         samplerate=sample_rate,
