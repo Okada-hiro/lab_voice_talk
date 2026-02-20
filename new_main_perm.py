@@ -1,4 +1,4 @@
-#今はこれ! 11/28 15:18
+#今はこれ! 2月20日 一旦安定する
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
