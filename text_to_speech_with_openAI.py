@@ -20,10 +20,7 @@ OPENAI_TTS_BYTE_CHUNK = int(os.getenv("OPENAI_TTS_BYTE_CHUNK", "8192"))
 OPENAI_TTS_INSTRUCTIONS = os.getenv(
     "OPENAI_TTS_INSTRUCTIONS",
     (
-        "polite Japanese customer support agent, "
-        "calm, clear pronunciation, consistent speaking rate, "
-        "higher pitch than normal,"
-        "slightly slow, neutral emotion"
+        "polite, calm, higher pitch, flat intonation, slow"
     ),
 )
 
