@@ -187,9 +187,12 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     full_answer = ""
     split_pattern = r'(?<=[。！？\n])'
     llm_tts_start = time.perf_counter()
-    TTS_WORKER_COUNT = 2
+    TTS_WORKER_COUNT = 1
     TTS_PREFETCH_AHEAD = 1
+    STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "2"))
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
+    if isinstance(stream_cfg, dict):
+        stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
     logger.info(
         "[TTS_CONFIG] "
         f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
@@ -648,6 +651,9 @@ async def get_root():
             let expectedSentenceId = 1;
             let expectedChunkId = 1;
             let isPlaying = false;
+            let jitterPrimed = false;
+            const JITTER_TARGET_MS = 320;   // 初回はこの分だけ貯めてから再生
+            const JITTER_LOW_WATER_MS = 120; // 再生中にここを下回ったら再バッファ
             let currentSourceNode = null;
             let currentAiBubble = null;
             
@@ -746,6 +752,17 @@ async def get_root():
                 expectedChunkId = 1;
                 nextStartTime = 0;
                 isPlaying = false;
+                jitterPrimed = false;
+            }
+
+            function getQueuedAudioMs() {
+                let totalBytes = 0;
+                for (const buf of audioQueue) {
+                    totalBytes += buf.byteLength;
+                }
+                // PCM16 mono @16kHz: 2 bytes/sample
+                const totalSamples = totalBytes / 2;
+                return (totalSamples / 16000) * 1000;
             }
 
             function flushOrderedAudio() {
@@ -901,9 +918,22 @@ async def get_root():
             async function processAudioQueue() {
                 if (audioQueue.length === 0) {
                     isPlaying = false;
+                    jitterPrimed = false;
                     return;
                 }
-                
+
+                const queuedMs = getQueuedAudioMs();
+                if (!jitterPrimed) {
+                    if (queuedMs < JITTER_TARGET_MS) {
+                        return;
+                    }
+                    jitterPrimed = true;
+                } else if (queuedMs < JITTER_LOW_WATER_MS) {
+                    // 低水位を下回ったら、少し貯まるまで再生を待つ
+                    jitterPrimed = false;
+                    return;
+                }
+
                 isPlaying = true;
                 const rawBytes = audioQueue.shift();
                 
