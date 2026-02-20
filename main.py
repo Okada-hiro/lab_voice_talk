@@ -183,7 +183,6 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     text_buffer = ""
     sentence_count = 0
     full_answer = ""
-    sentence_end_pattern = re.compile(r"[。！？.!?\n]")
 
     iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
@@ -201,21 +200,6 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
             return next(gen)
         except StopIteration:
             return None
-
-    def _extract_complete_sentences(buf: str):
-        """
-        文末記号までを「1文」として切り出す。
-        戻り値: (sentences, rest)
-        """
-        sentences = []
-        start = 0
-        for m in sentence_end_pattern.finditer(buf):
-            end = m.end()
-            piece = buf[start:end].strip()
-            if piece:
-                sentences.append(piece)
-            start = end
-        return sentences, buf[start:]
 
     async def tts_worker():
         while True:
@@ -275,16 +259,11 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     "alert_type": "irrelevant"
                 })
                 return
-
-            completed_sentences, text_buffer = _extract_complete_sentences(text_buffer)
-            for sent in completed_sentences:
-                sentence_count += 1
-                await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
-                await text_queue.put((sentence_count, sent))
+            if chunk:
+                await websocket.send_json({"status": "reply_chunk", "text_chunk": chunk})
         
         if text_buffer.strip():
             sentence_count += 1
-            await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
             await text_queue.put((sentence_count, text_buffer))
 
         await text_queue.put(STOP)
