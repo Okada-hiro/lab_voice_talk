@@ -22,7 +22,11 @@ pip install -U ctranslate2 faster-whisper
 pip install -U librosa scipy soundfile pyworld pyopenjtalk num2words pydub
 
 # Web / AI libraries for main.py pipeline
-pip install -U fastapi "uvicorn[standard]" google-generativeai openai huggingface_hub loguru transformers speechbrain python-dotenv websockets
+pip install -U fastapi "uvicorn[standard]" google-generativeai openai loguru python-dotenv websockets
+
+# Keep SpeechBrain and HF Hub compatible
+pip install -U "huggingface_hub==0.25.2"
+pip install -U "speechbrain==0.5.16"
 
 echo "[INFO] OpenAI pipeline environment setup completed."
 echo "[INFO] Set API keys before running:"

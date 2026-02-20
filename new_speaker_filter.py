@@ -1,7 +1,12 @@
 # /workspace/new_speaker_filter.py (判定安定化版: 閾値緩和 & 正規化)
 import torch
 import torchaudio
-from speechbrain.inference.classifiers import EncoderClassifier
+try:
+    # speechbrain >= 1.x
+    from speechbrain.inference.classifiers import EncoderClassifier
+except ImportError:
+    # speechbrain 0.5.x
+    from speechbrain.pretrained import EncoderClassifier
 import os
 import logging
 import torch.nn.functional as F
