@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from new_answer_generator import generate_answer_stream
-    import new_text_to_speech_qwen3tts_streaming as tts_module
-    from new_text_to_speech_qwen3tts_streaming import (
+    import new_text_to_speech as tts_module
+    from new_text_to_speech import (
         synthesize_speech,
         synthesize_speech_to_memory,
         synthesize_speech_to_memory_stream,
@@ -189,7 +189,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     llm_tts_start = time.perf_counter()
     TTS_WORKER_COUNT = 1
     TTS_PREFETCH_AHEAD = 1
-    STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "2"))
+    STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
     if isinstance(stream_cfg, dict):
         stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
