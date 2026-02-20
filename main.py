@@ -10,4 +10,5 @@ if __name__ == "__main__":
         speed=0.95,
         pitch=0.3,
         style="calm",
+        output_path="openai_tts_out.wav",
     )

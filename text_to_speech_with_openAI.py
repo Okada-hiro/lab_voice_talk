@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -18,6 +19,7 @@ def stream_tts_openai(
     speed: float = 0.95,
     pitch: float = 0.3,
     style: str = "calm",
+    output_path: str | None = "openai_tts_out.wav",
 ) -> None:
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
@@ -29,13 +31,20 @@ def stream_tts_openai(
 
     client = OpenAI(api_key=api_key)
 
-    stream = sd.OutputStream(
-        samplerate=sample_rate,
-        channels=1,
-        dtype="int16",
-    )
-    stream.start()
+    stream = None
+    can_play = True
+    try:
+        stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+        )
+        stream.start()
+    except Exception as e:
+        can_play = False
+        print(f"[WARN] Audio device unavailable. Fallback to file output only: {e}")
 
+    collected = []
     try:
         with client.audio.speech.with_streaming_response.create(
             model=model,
@@ -51,10 +60,18 @@ def stream_tts_openai(
                 if not chunk:
                     continue
                 audio = np.frombuffer(chunk, dtype=np.int16)
-                stream.write(audio)
+                collected.append(audio.copy())
+                if can_play and stream is not None:
+                    stream.write(audio)
     finally:
-        stream.stop()
-        stream.close()
+        if stream is not None:
+            stream.stop()
+            stream.close()
+
+    if output_path and collected:
+        pcm = np.concatenate(collected)
+        sf.write(output_path, pcm, sample_rate, subtype="PCM_16")
+        print(f"[INFO] Saved audio: {output_path}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -66,6 +83,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--speed", type=float, default=float(os.getenv("OPENAI_TTS_SPEED", "0.95")))
     parser.add_argument("--pitch", type=float, default=float(os.getenv("OPENAI_TTS_PITCH", "0.3")))
     parser.add_argument("--style", default=os.getenv("OPENAI_TTS_STYLE", "calm"))
+    parser.add_argument("--output", default=os.getenv("OPENAI_TTS_OUTPUT", "openai_tts_out.wav"))
     return parser.parse_args()
 
 
@@ -79,6 +97,7 @@ def main() -> None:
         speed=args.speed,
         pitch=args.pitch,
         style=args.style,
+        output_path=args.output,
     )
 
 
