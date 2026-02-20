@@ -211,35 +211,76 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
 
                 idx, phrase = item
                 total_len = 0
+                chunk_idx = 0
                 stream_gen = synthesize_speech_to_memory_stream(phrase)
                 while True:
                     pcm_chunk = await asyncio.to_thread(_next_stream_chunk_or_none, stream_gen)
                     if pcm_chunk is None:
                         break
+                    chunk_idx += 1
                     total_len += len(pcm_chunk)
-                    await audio_queue.put((idx, pcm_chunk, False, 0))
-                await audio_queue.put((idx, b"", True, total_len))
+                    # 連番入りファイル名で一時保存（順序保証のため）
+                    chunk_filename = f"tts_s{idx:04d}_c{chunk_idx:06d}.pcm"
+                    chunk_path = os.path.join(PROCESSING_DIR, chunk_filename)
+                    with open(chunk_path, "wb") as f:
+                        f.write(pcm_chunk)
+                    await audio_queue.put((idx, chunk_idx, chunk_path, False, 0))
+                await audio_queue.put((idx, -1, "", True, total_len))
             finally:
                 text_queue.task_done()
 
     async def audio_sender_worker():
+        pending = {}
+        expected_chunk = {}
+        done_meta = {}
+
+        async def _flush_ready(sentence_idx: int):
+            if sentence_idx not in expected_chunk:
+                expected_chunk[sentence_idx] = 1
+            if sentence_idx not in pending:
+                pending[sentence_idx] = {}
+
+            while expected_chunk[sentence_idx] in pending[sentence_idx]:
+                path = pending[sentence_idx].pop(expected_chunk[sentence_idx])
+                try:
+                    with open(path, "rb") as f:
+                        audio_bytes = f.read()
+                finally:
+                    if os.path.exists(path):
+                        os.remove(path)
+
+                offset = 0
+                while offset < len(audio_bytes):
+                    chunk = audio_bytes[offset: offset + CHUNK_SIZE]
+                    await websocket.send_bytes(chunk)
+                    offset += CHUNK_SIZE
+                    await asyncio.sleep(0)
+
+                expected_chunk[sentence_idx] += 1
+
+            if sentence_idx in done_meta and not pending[sentence_idx]:
+                total_len = done_meta[sentence_idx]
+                logger.info(f"🚀 Streamed audio {sentence_idx} (Total: {total_len} bytes)")
+                done_meta.pop(sentence_idx, None)
+                pending.pop(sentence_idx, None)
+                expected_chunk.pop(sentence_idx, None)
+
         while True:
             item = await audio_queue.get()
             try:
                 if item is STOP:
                     return
 
-                idx, audio_bytes, is_done, total_len = item
-                if audio_bytes:
-                    offset = 0
-                    while offset < len(audio_bytes):
-                        chunk = audio_bytes[offset: offset + CHUNK_SIZE]
-                        await websocket.send_bytes(chunk)
-                        offset += CHUNK_SIZE
-                        await asyncio.sleep(0)
-
+                idx, chunk_idx, chunk_path, is_done, total_len = item
                 if is_done:
-                    logger.info(f"🚀 Streamed audio {idx} (Total: {total_len} bytes)")
+                    done_meta[idx] = total_len
+                    await _flush_ready(idx)
+                    continue
+
+                if idx not in pending:
+                    pending[idx] = {}
+                pending[idx][chunk_idx] = chunk_path
+                await _flush_ready(idx)
             finally:
                 audio_queue.task_done()
 
