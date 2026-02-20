@@ -25,11 +25,7 @@ logger = logging.getLogger(__name__)
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from new_answer_generator import generate_answer_stream
-    from new_text_to_speech import (
-        synthesize_speech,
-        synthesize_speech_to_memory,
-        synthesize_speech_to_memory_stream,
-    )
+    from new_text_to_speech import synthesize_speech, synthesize_speech_to_memory
     from new_speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
@@ -196,12 +192,6 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     text_queue = asyncio.Queue()
     audio_queue = asyncio.Queue()
 
-    def _next_stream_chunk_or_none(gen):
-        try:
-            return next(gen)
-        except StopIteration:
-            return None
-
     async def tts_worker():
         while True:
             item = await text_queue.get()
@@ -211,15 +201,9 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     return
 
                 idx, phrase = item
-                total_len = 0
-                stream_gen = synthesize_speech_to_memory_stream(phrase)
-                while True:
-                    pcm_chunk = await asyncio.to_thread(_next_stream_chunk_or_none, stream_gen)
-                    if pcm_chunk is None:
-                        break
-                    total_len += len(pcm_chunk)
-                    await audio_queue.put((idx, pcm_chunk, False, 0))
-                await audio_queue.put((idx, b"", True, total_len))
+                full_wav_bytes = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
+                if full_wav_bytes:
+                    await audio_queue.put((idx, full_wav_bytes))
             finally:
                 text_queue.task_done()
 
@@ -230,17 +214,16 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 if item is STOP:
                     return
 
-                idx, audio_bytes, is_done, total_len = item
-                if audio_bytes:
-                    offset = 0
-                    while offset < len(audio_bytes):
-                        chunk = audio_bytes[offset: offset + CHUNK_SIZE]
-                        await websocket.send_bytes(chunk)
-                        offset += CHUNK_SIZE
-                        await asyncio.sleep(0)
+                idx, full_wav_bytes = item
+                total_len = len(full_wav_bytes)
+                offset = 0
+                while offset < total_len:
+                    chunk = full_wav_bytes[offset: offset + CHUNK_SIZE]
+                    await websocket.send_bytes(chunk)
+                    offset += CHUNK_SIZE
+                    await asyncio.sleep(0)
 
-                if is_done:
-                    logger.info(f"🚀 Streamed audio {idx} (Total: {total_len} bytes)")
+                logger.info(f"🚀 Streamed audio {idx} (Total: {total_len} bytes)")
             finally:
                 audio_queue.task_done()
 

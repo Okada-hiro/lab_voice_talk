@@ -25,14 +25,14 @@ pip install librosa scipy soundfile pyworld pyopenjtalk num2words pydub
 pip install fastapi uvicorn[standard] google-generativeai openai huggingface_hub loguru transformers speechbrain
 
 # -------------------------------------
-# 5. Qwen3-TTS (streaming fork)
-#    - Install streaming-enabled qwen_tts as active package
+# 5. Qwen3-TTS (standard install + source clone)
+#    - Standard pip package install (no manual steps required)
+#    - Clone source repo for reference / optional manual patching later
 # -------------------------------------
+pip install qwen-tts
+
 WORKDIR="${WORKDIR:-/workspace}"
 mkdir -p "${WORKDIR}"
-if [ ! -d "${WORKDIR}/Qwen3-TTS-streaming" ]; then
-  git clone https://github.com/dffdeeq/Qwen3-TTS-streaming.git "${WORKDIR}/Qwen3-TTS-streaming"
+if [ ! -d "${WORKDIR}/Qwen3-TTS" ]; then
+  git clone https://github.com/QwenLM/Qwen3-TTS.git "${WORKDIR}/Qwen3-TTS"
 fi
-
-pip uninstall -y qwen-tts qwen_tts || true
-pip install -e "${WORKDIR}/Qwen3-TTS-streaming"
