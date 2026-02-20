@@ -2,32 +2,27 @@
 set -euo pipefail
 
 apt-get update
-apt-get install -y ffmpeg sox git build-essential libsndfile1 libportaudio2 portaudio19-dev
+apt-get install -y ffmpeg sox git build-essential ninja-build libsndfile1 libportaudio2 portaudio19-dev
 
 PY_VER="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-echo "[INFO] Python version: ${PY_VER}"
-
-pip install -U pip setuptools wheel
-
-# Torch stack (required by main.py / speaker filter / VAD)
-if ! python -c 'import torch' >/dev/null 2>&1; then
-  pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-else
-  echo "[INFO] torch already installed. skip torch install"
+if [ "${PY_VER}" != "3.10" ]; then
+  echo "[WARN] Recommended Python is 3.10, current: ${PY_VER}"
 fi
 
-# ASR / audio
-pip install -U numpy scipy soundfile librosa
+pip install -U pip setuptools wheel packaging psutil ninja
+
+# Torch stack (same base as setup_environment.sh)
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# ASR dependencies
+pip uninstall -y ctranslate2 faster-whisper || true
 pip install -U ctranslate2 faster-whisper
 
-# Speaker verification
-pip install -U speechbrain
+# Audio libraries (include librosa for transcribe_func.py)
+pip install -U librosa scipy soundfile pyworld pyopenjtalk num2words pydub
 
-# App server / env
-pip install -U fastapi "uvicorn[standard]" websockets python-dotenv loguru
-
-# LLM + TTS API clients
-pip install -U openai google-generativeai
+# Web / AI libraries for main.py pipeline
+pip install -U fastapi "uvicorn[standard]" google-generativeai openai huggingface_hub loguru transformers speechbrain python-dotenv websockets
 
 echo "[INFO] OpenAI pipeline environment setup completed."
 echo "[INFO] Set API keys before running:"
