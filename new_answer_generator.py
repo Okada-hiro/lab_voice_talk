@@ -82,7 +82,7 @@ user: 「じゃあ、そこに行こう。あそこは紅茶が美味しいん�
 """
 # モデル名 (確実に動作するもの)
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
-FALLBACK_MESSAGE = "お電話ありがとうございます。こちらは保険会社です。担当におつなぎします。"
+FALLBACK_MESSAGE = "おでんわ、ありがとうございます。こちらは、ほけんがいしゃです。たんとうに、おつなぎします。"
 
 
 def _fallback_stream(message: str = FALLBACK_MESSAGE):
