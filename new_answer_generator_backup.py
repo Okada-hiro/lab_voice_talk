@@ -82,14 +82,6 @@ user: 「じゃあ、そこに行こう。あそこは紅茶が美味しいん�
 """
 # モデル名 (確実に動作するもの)
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
-FALLBACK_MESSAGE = "お電話ありがとうございます。こちらは保険会社です。担当におつなぎします。"
-
-
-def _fallback_stream(message: str = FALLBACK_MESSAGE):
-    """TTSの自然さを保つため、短い塊で逐次返す。"""
-    step = 12
-    for i in range(0, len(message), step):
-        yield message[i:i + step]
 
 def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = None):
     """
@@ -123,29 +115,22 @@ def generate_answer_stream(question: str, model=DEFAULT_MODEL, history: list = N
             response = chat_session.send_message(question, stream=True)
             
             # ★★★ エラー対策の修正箇所 ★★★
-            yielded_any = False
             for chunk in response:
                 try:
                     # chunk.text にアクセスしてみて、中身があれば yield する
                     text_part = chunk.text
                     if text_part:
-                        yielded_any = True
                         yield text_part
                 except ValueError:
                     # 「終了合図」などの空データが来た場合、ValueErrorが出るので無視して次へ
                     continue
-
-            # クォータ超過等で実質空応答になった場合のフォールバック
-            if not yielded_any:
-                print("[WARN] Gemini returned empty response. Using fallback message.")
-                yield from _fallback_stream()
 
         else:
             yield f"対応していないモデル名です: {model}"
 
     except Exception as e:
         print(f"[ERROR] ストリーミング生成エラー: {e}")
-        yield from _fallback_stream()
+        yield "申し訳ありません、エラーが発生しました。"
 
 
 # --- 単体テスト ---
