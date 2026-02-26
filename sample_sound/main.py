@@ -1,4 +1,4 @@
-#今はこれ! 2月20日 一旦安定する
+#今はこれ! 11/28 15:18
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -12,7 +12,6 @@ import sys
 import os
 import io
 import re
-import time
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -26,8 +25,7 @@ logger = logging.getLogger(__name__)
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from new_answer_generator import generate_answer_stream
-    import new_text_to_speech as tts_module
-    from new_text_to_speech import (
+    from text_to_speech_with_openAI import (
         synthesize_speech,
         synthesize_speech_to_memory,
         synthesize_speech_to_memory_stream,
@@ -185,44 +183,17 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     text_buffer = ""
     sentence_count = 0
     full_answer = ""
-    split_pattern = r'(?<=[。！？\n])'
-    llm_tts_start = time.perf_counter()
-    TTS_WORKER_COUNT = 1
-    TTS_PREFETCH_AHEAD = 1
-    STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
-    stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
-    if isinstance(stream_cfg, dict):
-        stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
-    logger.info(
-        "[TTS_CONFIG] "
-        f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
-        f"decode_window_frames={stream_cfg.get('decode_window_frames')} "
-        f"overlap_samples={stream_cfg.get('overlap_samples')} "
-        f"first_chunk_emit_every={stream_cfg.get('first_chunk_emit_every')} "
-        f"first_chunk_decode_window={stream_cfg.get('first_chunk_decode_window')} "
-        f"first_chunk_frames={stream_cfg.get('first_chunk_frames')} "
-        f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
-        f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
-        f"tts_workers={TTS_WORKER_COUNT} prefetch_ahead={TTS_PREFETCH_AHEAD}"
-    )
-    logger.info(
-        f"[LLM_TTS_FLOW] start text_for_llm_len={len(text_for_llm)} "
-        f"history_len={len(chat_history)} split_pattern={split_pattern}"
-    )
 
     iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
-    # 16kHz / PCM16 / mono を維持しつつ、20ms単位で細かく送る
-    SAMPLE_RATE = 16000
+    # TTS出力(PCM16 / mono)を20ms単位で細かく送る
+    SAMPLE_RATE = 24000
     BYTES_PER_SAMPLE = 2
     FRAME_MS = 20
     CHUNK_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * FRAME_MS // 1000
     STOP = object()
     text_queue = asyncio.Queue()
     audio_queue = asyncio.Queue()
-    sentence_enqueued_at = {}
-    first_audio_sent_at = None
-    worker_stop_count = 0
 
     def _next_stream_chunk_or_none(gen):
         try:
@@ -230,196 +201,96 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
         except StopIteration:
             return None
 
-    async def tts_worker(worker_id: int):
-        nonlocal worker_stop_count
-        logger.info(f"[TTS_WORKER] worker={worker_id} started")
+    async def tts_worker():
         while True:
             item = await text_queue.get()
             try:
                 if item is STOP:
-                    worker_stop_count += 1
-                    logger.info(
-                        f"[TTS_WORKER] worker={worker_id} got_stop "
-                        f"worker_stop_count={worker_stop_count}/{TTS_WORKER_COUNT}"
-                    )
-                    if worker_stop_count == TTS_WORKER_COUNT:
-                        await audio_queue.put({"type": "stop"})
-                        logger.info("[TTS_WORKER] all workers stopped -> audio_queue stop queued")
+                    await audio_queue.put(STOP)
                     return
 
                 idx, phrase = item
-                sentence_start = time.perf_counter()
-                queue_wait_ms = (sentence_start - sentence_enqueued_at.get(idx, sentence_start)) * 1000.0
-                logger.info(
-                    f"[TTS_TIMING] worker={worker_id} sentence={idx} "
-                    f"stage=tts_start text_len={len(phrase)} queue_wait_ms={queue_wait_ms:.1f}"
-                )
                 total_len = 0
-                tts_chunk_count = 0
-                first_chunk_ready_ms = None
-                try:
-                    stream_gen = synthesize_speech_to_memory_stream(phrase)
-                    while True:
-                        chunk_wait_start = time.perf_counter()
-                        pcm_chunk = await asyncio.to_thread(_next_stream_chunk_or_none, stream_gen)
-                        chunk_gen_ms = (time.perf_counter() - chunk_wait_start) * 1000.0
-                        if pcm_chunk is None:
-                            break
-                        tts_chunk_count += 1
-                        if first_chunk_ready_ms is None:
-                            first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
-                        total_len += len(pcm_chunk)
-                        created_at = time.perf_counter()
-                        await audio_queue.put(
-                            {
-                                "type": "chunk",
-                                "sentence_idx": idx,
-                                "tts_chunk_idx": tts_chunk_count,
-                                "worker_id": worker_id,
-                                "audio_bytes": pcm_chunk,
-                                "total_bytes": 0,
-                                "chunk_gen_ms": chunk_gen_ms,
-                                "created_at": created_at,
-                            }
-                        )
-                        logger.info(
-                            f"[TTS_TIMING] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
-                            f"chunk_bytes={len(pcm_chunk)} chunk_gen_ms={chunk_gen_ms:.1f}"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"[TTS_TIMING] worker={worker_id} sentence={idx} stream_tts_failed: {e}",
-                        exc_info=True,
-                    )
-
-                # ストリーミングで1チャンクも取れなかった場合は非ストリーミングへフォールバック
-                if tts_chunk_count == 0:
-                    logger.warning(
-                        f"[TTS_TIMING] worker={worker_id} sentence={idx} no_stream_chunk -> fallback_non_streaming"
-                    )
-                    fallback_start = time.perf_counter()
-                    pcm_all = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
-                    fallback_ms = (time.perf_counter() - fallback_start) * 1000.0
-                    if pcm_all:
-                        tts_chunk_count = 1
-                        total_len = len(pcm_all)
-                        if first_chunk_ready_ms is None:
-                            first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
-                        await audio_queue.put(
-                            {
-                                "type": "chunk",
-                                "sentence_idx": idx,
-                                "tts_chunk_idx": tts_chunk_count,
-                                "worker_id": worker_id,
-                                "audio_bytes": pcm_all,
-                                "total_bytes": 0,
-                                "chunk_gen_ms": fallback_ms,
-                                "created_at": time.perf_counter(),
-                            }
-                        )
-                        logger.info(
-                            f"[TTS_TIMING] worker={worker_id} sentence={idx} fallback_chunk_bytes={len(pcm_all)} "
-                            f"fallback_gen_ms={fallback_ms:.1f}"
-                        )
-                    else:
-                        logger.warning(
-                            f"[TTS_TIMING] worker={worker_id} sentence={idx} fallback returned empty pcm"
-                        )
-
-                total_tts_ms = (time.perf_counter() - sentence_start) * 1000.0
-                await audio_queue.put(
-                    {
-                        "type": "done",
-                        "sentence_idx": idx,
-                        "tts_chunk_idx": tts_chunk_count,
-                        "worker_id": worker_id,
-                        "audio_bytes": b"",
-                        "total_bytes": total_len,
-                        "chunk_gen_ms": None,
-                        "created_at": time.perf_counter(),
-                        "first_chunk_ready_ms": first_chunk_ready_ms,
-                        "total_tts_ms": total_tts_ms,
-                        "queue_wait_ms": queue_wait_ms,
-                    }
-                )
-                logger.info(
-                    f"[TTS_TIMING] worker={worker_id} sentence={idx} stage=tts_done "
-                    f"tts_chunk_count={tts_chunk_count} total_bytes={total_len} total_tts_ms={total_tts_ms:.1f}"
-                )
+                chunk_idx = 0
+                stream_gen = synthesize_speech_to_memory_stream(phrase)
+                while True:
+                    pcm_chunk = await asyncio.to_thread(_next_stream_chunk_or_none, stream_gen)
+                    if pcm_chunk is None:
+                        break
+                    chunk_idx += 1
+                    total_len += len(pcm_chunk)
+                    # 連番入りファイル名で一時保存（順序保証のため）
+                    chunk_filename = f"tts_s{idx:04d}_c{chunk_idx:06d}.pcm"
+                    chunk_path = os.path.join(PROCESSING_DIR, chunk_filename)
+                    with open(chunk_path, "wb") as f:
+                        f.write(pcm_chunk)
+                    await audio_queue.put((idx, chunk_idx, chunk_path, False, 0))
+                await audio_queue.put((idx, -1, "", True, total_len))
             finally:
                 text_queue.task_done()
 
     async def audio_sender_worker():
-        nonlocal first_audio_sent_at
-        sent_arrival_seq = 0
-        logger.info("[AUDIO_SENDER] started")
+        pending = {}
+        expected_chunk = {}
+        done_meta = {}
+
+        async def _flush_ready(sentence_idx: int):
+            if sentence_idx not in expected_chunk:
+                expected_chunk[sentence_idx] = 1
+            if sentence_idx not in pending:
+                pending[sentence_idx] = {}
+
+            while expected_chunk[sentence_idx] in pending[sentence_idx]:
+                path = pending[sentence_idx].pop(expected_chunk[sentence_idx])
+                try:
+                    with open(path, "rb") as f:
+                        audio_bytes = f.read()
+                finally:
+                    if os.path.exists(path):
+                        os.remove(path)
+
+                offset = 0
+                while offset < len(audio_bytes):
+                    chunk = audio_bytes[offset: offset + CHUNK_SIZE]
+                    await websocket.send_bytes(chunk)
+                    offset += CHUNK_SIZE
+                    await asyncio.sleep(0)
+
+                expected_chunk[sentence_idx] += 1
+
+            if sentence_idx in done_meta and not pending[sentence_idx]:
+                total_len = done_meta[sentence_idx]
+                logger.info(f"🚀 Streamed audio {sentence_idx} (Total: {total_len} bytes)")
+                done_meta.pop(sentence_idx, None)
+                pending.pop(sentence_idx, None)
+                expected_chunk.pop(sentence_idx, None)
+
         while True:
             item = await audio_queue.get()
             try:
-                if item.get("type") == "stop":
-                    logger.info("[AUDIO_SENDER] got_stop -> exit")
+                if item is STOP:
                     return
 
-                if item["type"] == "chunk":
-                    idx = item["sentence_idx"]
-                    tts_chunk_idx = item["tts_chunk_idx"]
-                    audio_bytes = item["audio_bytes"]
-                    send_start = time.perf_counter()
-                    queue_to_send_ms = (send_start - item["created_at"]) * 1000.0
-                    sent_arrival_seq += 1
-                    await websocket.send_json(
-                        {
-                            "status": "audio_chunk_meta",
-                            "sentence_id": idx,
-                            "chunk_id": tts_chunk_idx,
-                            "arrival_seq": sent_arrival_seq,
-                            "byte_len": len(audio_bytes),
-                            "sample_rate": SAMPLE_RATE,
-                        }
-                    )
-                    await websocket.send_bytes(audio_bytes)
-                    send_ms = (time.perf_counter() - send_start) * 1000.0
+                idx, chunk_idx, chunk_path, is_done, total_len = item
+                if is_done:
+                    done_meta[idx] = total_len
+                    await _flush_ready(idx)
+                    continue
 
-                    if first_audio_sent_at is None:
-                        first_audio_sent_at = time.perf_counter()
-                        first_audio_ms = (first_audio_sent_at - llm_tts_start) * 1000.0
-                        logger.info(f"[TTS_TIMING] first_audio_sent_ms={first_audio_ms:.1f}")
-
-                    logger.info(
-                        f"[TTS_TIMING] worker={item['worker_id']} sentence={idx} "
-                        f"tts_chunk={tts_chunk_idx} stage=send chunk_bytes={len(audio_bytes)} "
-                        f"ws_chunks=1 queue_to_send_ms={queue_to_send_ms:.1f} send_ms={send_ms:.1f}"
-                    )
-                elif item["type"] == "done":
-                    await websocket.send_json(
-                        {
-                            "status": "audio_sentence_done",
-                            "sentence_id": item["sentence_idx"],
-                            "last_chunk_id": item.get("tts_chunk_idx", 0),
-                            "total_bytes": item.get("total_bytes", 0),
-                        }
-                    )
-                    logger.info(
-                        f"🚀 Streamed audio {item['sentence_idx']} (Total: {item.get('total_bytes', 0)} bytes) "
-                        f"[TTS_TIMING] queue_wait_ms={item.get('queue_wait_ms', 0.0):.1f} "
-                        f"first_chunk_ready_ms={item.get('first_chunk_ready_ms', 0.0) or 0.0:.1f} "
-                        f"total_tts_ms={item.get('total_tts_ms', 0.0):.1f} "
-                        f"tts_chunk_count={item.get('tts_chunk_idx', 0)}"
-                    )
+                if idx not in pending:
+                    pending[idx] = {}
+                pending[idx][chunk_idx] = chunk_path
+                await _flush_ready(idx)
             finally:
                 audio_queue.task_done()
 
-    tts_tasks = [asyncio.create_task(tts_worker(i + 1)) for i in range(TTS_WORKER_COUNT)]
+    tts_task = asyncio.create_task(tts_worker())
     sender_task = asyncio.create_task(audio_sender_worker())
 
     try:
         for chunk in iterator:
             text_buffer += chunk
             full_answer += chunk
-            logger.info(
-                f"[LLM_STREAM] got_chunk len={len(chunk)} "
-                f"buffer_len={len(text_buffer)} full_len={len(full_answer)}"
-            )
             
             # ★ "irrelevant" タイプとして送信
             if full_answer.strip() == "[SILENCE]":
@@ -429,67 +300,29 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     "alert_type": "irrelevant"
                 })
                 return
-
-            sentences = re.split(split_pattern, text_buffer)
-            if len(sentences) > 1:
-                logger.info(
-                    f"[LLM_STREAM] sentence_split count={len(sentences)-1} "
-                    f"tail_len={len(sentences[-1])}"
-                )
-                for sent in sentences[:-1]:
-                    if sent.strip():
-                        sentence_count += 1
-                        await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
-                        sentence_enqueued_at[sentence_count] = time.perf_counter()
-                        await text_queue.put((sentence_count, sent))
-                        logger.info(
-                            f"[LLM_STREAM] enqueued sentence={sentence_count} len={len(sent)} "
-                            f"text_queue_size={text_queue.qsize()}"
-                        )
-                text_buffer = sentences[-1]
+            if chunk:
+                await websocket.send_json({"status": "reply_chunk", "text_chunk": chunk})
         
         if text_buffer.strip():
             sentence_count += 1
-            await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
-            sentence_enqueued_at[sentence_count] = time.perf_counter()
             await text_queue.put((sentence_count, text_buffer))
-            logger.info(
-                f"[LLM_STREAM] enqueued tail sentence={sentence_count} len={len(text_buffer)} "
-                f"text_queue_size={text_queue.qsize()}"
-            )
 
-        logger.info("[LLM_STREAM] iterator_done -> sending stop signals to workers")
-        for _ in range(TTS_WORKER_COUNT):
-            await text_queue.put(STOP)
-        logger.info(
-            f"[LLM_STREAM] stop_signals_sent count={TTS_WORKER_COUNT} "
-            f"text_queue_size={text_queue.qsize()}"
-        )
+        await text_queue.put(STOP)
         await text_queue.join()
-        logger.info("[SYNC] text_queue joined")
         await audio_queue.join()
-        logger.info("[SYNC] audio_queue joined")
-        for task in tts_tasks:
-            await task
-        logger.info("[SYNC] all tts_workers joined")
+        await tts_task
         await sender_task
-        logger.info("[SYNC] audio_sender joined")
 
         chat_history.append({"role": "user", "parts": [text_for_llm]})
         chat_history.append({"role": "model", "parts": [full_answer]})
         
         await websocket.send_json({"status": "complete", "answer_text": full_answer})
-        logger.info(
-            f"[LLM_TTS_FLOW] complete answer_len={len(full_answer)} "
-            f"total_llm_tts_ms={(time.perf_counter() - llm_tts_start)*1000.0:.1f}"
-        )
 
     except Exception as e:
         logger.error(f"LLM/TTS Error: {e}")
     finally:
-        for task in tts_tasks:
-            if not task.done():
-                task.cancel()
+        if not tts_task.done():
+            tts_task.cancel()
         if not sender_task.done():
             sender_task.cancel()
 
@@ -730,17 +563,13 @@ async def get_root():
             const toastContainer = document.getElementById('toast-container');
 
             let audioQueue = [];
-            let audioMetaQueue = [];
-            let pendingOrderedAudio = new Map();
-            let sentenceDoneMap = new Map();
-            let expectedSentenceId = 1;
-            let expectedChunkId = 1;
             let isPlaying = false;
-            let jitterPrimed = false;
-            const JITTER_TARGET_MS = 320;   // 初回はこの分だけ貯めてから再生
-            const JITTER_LOW_WATER_MS = 120; // 再生中にここを下回ったら再バッファ
             let currentSourceNode = null;
             let currentAiBubble = null;
+            const TTS_SAMPLE_RATE = 24000;
+            const PLAYBACK_START_BUFFER_MS = 300;
+            let queuedSamples = 0;
+            let streamCompleted = false;
             
             // ★「今後表示しない」設定
             let muteUnregisteredWarning = false;
@@ -824,61 +653,6 @@ async def get_root():
                 } catch(e) { console.error(e); }
             };
 
-            function makeChunkKey(sentenceId, chunkId) {
-                return `${sentenceId}:${chunkId}`;
-            }
-
-            function resetOrderedAudioState() {
-                audioQueue = [];
-                audioMetaQueue = [];
-                pendingOrderedAudio.clear();
-                sentenceDoneMap.clear();
-                expectedSentenceId = 1;
-                expectedChunkId = 1;
-                nextStartTime = 0;
-                isPlaying = false;
-                jitterPrimed = false;
-            }
-
-            function getQueuedAudioMs() {
-                let totalBytes = 0;
-                for (const buf of audioQueue) {
-                    totalBytes += buf.byteLength;
-                }
-                // PCM16 mono @16kHz: 2 bytes/sample
-                const totalSamples = totalBytes / 2;
-                return (totalSamples / 16000) * 1000;
-            }
-
-            function flushOrderedAudio() {
-                while (true) {
-                    const key = makeChunkKey(expectedSentenceId, expectedChunkId);
-                    if (pendingOrderedAudio.has(key)) {
-                        audioQueue.push(pendingOrderedAudio.get(key));
-                        pendingOrderedAudio.delete(key);
-                        expectedChunkId += 1;
-                        if (!isPlaying) {
-                            processAudioQueue();
-                        }
-                        continue;
-                    }
-
-                    const doneInfo = sentenceDoneMap.get(expectedSentenceId);
-                    if (doneInfo && expectedChunkId > doneInfo.lastChunkId) {
-                        expectedSentenceId += 1;
-                        expectedChunkId = 1;
-                        continue;
-                    }
-                    break;
-                }
-            }
-
-            function queueOrderedChunk(meta, rawBytes) {
-                const key = makeChunkKey(meta.sentence_id, meta.chunk_id);
-                pendingOrderedAudio.set(key, rawBytes);
-                flushOrderedAudio();
-            }
-
             async function startRecording() {
                 try {
                     statusDiv.textContent = "サーバー接続中...";
@@ -897,14 +671,9 @@ async def get_root():
 
                     socket.onmessage = async (event) => {
                         if (event.data instanceof ArrayBuffer) {
-                            const meta = audioMetaQueue.shift();
-                            if (meta) {
-                                queueOrderedChunk(meta, event.data);
-                            } else {
-                                // Fallback for legacy binary packets without metadata.
-                                audioQueue.push(event.data);
-                                processAudioQueue();
-                            }
+                            audioQueue.push(event.data);
+                            queuedSamples += (event.data.byteLength / 2); // PCM16 mono
+                            processAudioQueue();
                         } else {
                             const data = JSON.parse(event.data);
                             
@@ -913,13 +682,6 @@ async def get_root():
                             }
                             if (data.status === 'interrupt') {
                                 stopAudioPlayback();
-                            }
-                            if (data.status === 'audio_chunk_meta') {
-                                audioMetaQueue.push(data);
-                            }
-                            if (data.status === 'audio_sentence_done') {
-                                sentenceDoneMap.set(data.sentence_id, { lastChunkId: data.last_chunk_id });
-                                flushOrderedAudio();
                             }
                             if (data.status === 'system_info') {
                                 logChat('ai', data.message);
@@ -954,10 +716,8 @@ async def get_root():
                                 }
                                 currentAiBubble = null;
                                 statusDiv.textContent = "🎙️ 準備OK";
-                                // Keep ordered state clean between turns.
-                                audioMetaQueue = [];
-                                pendingOrderedAudio.clear();
-                                sentenceDoneMap.clear();
+                                streamCompleted = true;
+                                processAudioQueue();
                             }
                         }
                     };
@@ -968,7 +728,7 @@ async def get_root():
             }
 
             async function initAudioStream() {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
                 sourceInput = audioContext.createMediaStreamSource(stream);
                 processor = audioContext.createScriptProcessor(512, 1, 1);
@@ -994,7 +754,10 @@ async def get_root():
 
             function stopAudioPlayback() {
                 if (currentSourceNode) { try { currentSourceNode.stop(); } catch(e){} currentSourceNode = null; }
-                resetOrderedAudioState();
+                audioQueue = [];
+                isPlaying = false;
+                queuedSamples = 0;
+                streamCompleted = false;
             }
 
             // ★追加: 再生時間を管理する変数
@@ -1003,24 +766,20 @@ async def get_root():
             async function processAudioQueue() {
                 if (audioQueue.length === 0) {
                     isPlaying = false;
-                    jitterPrimed = false;
                     return;
                 }
 
-                const queuedMs = getQueuedAudioMs();
-                if (!jitterPrimed) {
-                    if (queuedMs < JITTER_TARGET_MS) {
+                // 300ms分たまるまで再生開始を待つ（ただしストリーム完了時は再生する）
+                if (!isPlaying) {
+                    const queuedMs = (queuedSamples / TTS_SAMPLE_RATE) * 1000;
+                    if (!streamCompleted && queuedMs < PLAYBACK_START_BUFFER_MS) {
                         return;
                     }
-                    jitterPrimed = true;
-                } else if (queuedMs < JITTER_LOW_WATER_MS) {
-                    // 低水位を下回ったら、少し貯まるまで再生を待つ
-                    jitterPrimed = false;
-                    return;
                 }
-
+                
                 isPlaying = true;
                 const rawBytes = audioQueue.shift();
+                queuedSamples = Math.max(0, queuedSamples - (rawBytes.byteLength / 2));
                 
                 try {
                     if (audioContext.state === 'suspended') {
@@ -1041,9 +800,9 @@ async def get_root():
                         float32Data[i] = int16Data[i] / 32768.0;
                     }
 
-                    // 3. 再生用バッファを作成 (モノラル, 長さ, 16000Hz)
-                    // ※new_text_to_speech.py の target_sr と合わせる必要があります(今は16000推奨)
-                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, 16000);
+                    // 3. 再生用バッファを作成 (モノラル, 長さ, 24000Hz)
+                    // ※text_to_speech_with_openAI.py の sample_rate と合わせる必要があります
+                    const audioBuffer = audioContext.createBuffer(1, float32Data.length, TTS_SAMPLE_RATE);
                     
                     // 4. データをバッファにコピー
                     audioBuffer.getChannelData(0).set(float32Data);
