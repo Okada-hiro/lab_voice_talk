@@ -191,6 +191,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     TTS_PREFETCH_AHEAD = 1
     STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
     STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
+    DETAILED_TIMING = os.getenv("PERM_DETAILED_TIMING", "0") == "1"
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
     if isinstance(stream_cfg, dict):
         stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
@@ -232,6 +233,9 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
         except StopIteration:
             return None
 
+    def _noop():
+        return None
+
     async def tts_worker(worker_id: int):
         nonlocal worker_stop_count
         logger.info(f"[TTS_WORKER] worker={worker_id} started")
@@ -262,9 +266,15 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 try:
                     stream_gen = synthesize_speech_to_memory_stream(phrase)
                     while True:
+                        # (E) to_thread / スケジューリング固定費の近似
+                        sched_probe_start = time.perf_counter()
+                        await asyncio.to_thread(_noop)
+                        to_thread_overhead_ms = (time.perf_counter() - sched_probe_start) * 1000.0
+
                         chunk_wait_start = time.perf_counter()
                         pcm_chunk = await asyncio.to_thread(_next_stream_chunk_or_none, stream_gen)
                         chunk_gen_ms = (time.perf_counter() - chunk_wait_start) * 1000.0
+                        approx_model_ms = max(0.0, chunk_gen_ms - to_thread_overhead_ms)
                         if pcm_chunk is None:
                             break
                         tts_chunk_count += 1
@@ -288,6 +298,12 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                             f"[TTS_TIMING] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
                             f"chunk_bytes={len(pcm_chunk)} chunk_gen_ms={chunk_gen_ms:.1f}"
                         )
+                        if DETAILED_TIMING:
+                            logger.info(
+                                f"[TTS_DETAILED] worker={worker_id} sentence={idx} chunk={tts_chunk_count} "
+                                f"to_thread_overhead_ms={to_thread_overhead_ms:.3f} "
+                                f"approx_model_ms={approx_model_ms:.1f}"
+                            )
                 except Exception as e:
                     logger.error(
                         f"[TTS_TIMING] worker={worker_id} sentence={idx} stream_tts_failed: {e}",

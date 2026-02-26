@@ -25,6 +25,7 @@ QWEN3_REF_TEXT = os.getenv("QWEN3_REF_TEXT", "")
 QWEN3_LANGUAGE = os.getenv("QWEN3_LANGUAGE", "Japanese")
 QWEN3_DTYPE = os.getenv("QWEN3_DTYPE", "bfloat16")
 QWEN3_XVECTOR_ONLY = os.getenv("QWEN3_XVECTOR_ONLY", "0") == "1"
+QWEN3_STAGE_TIMING = os.getenv("QWEN3_STAGE_TIMING", "0") == "1"
 
 DEFAULT_PARAMS = {
     "instruct": "人間らしく、感情豊かに、自然な息遣いで話してください。文末をはっきりと発音すること！",
@@ -218,12 +219,43 @@ def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = No
         top_k=DEFAULT_PARAMS["top_k"],
     )
 
-    for wav_chunk, sr in chunk_iter:
+    chunk_idx = 0
+    while True:
+        model_wait_start = time.perf_counter()
+        try:
+            wav_chunk, sr = next(chunk_iter)
+        except StopIteration:
+            break
+        model_wait_ms = (time.perf_counter() - model_wait_start) * 1000.0
+
+        chunk_idx += 1
+        copy_start = time.perf_counter()
         wav_chunk = np.asarray(wav_chunk, dtype=np.float32)
+        copy_ms = (time.perf_counter() - copy_start) * 1000.0
         if wav_chunk.size == 0:
+            if QWEN3_STAGE_TIMING:
+                print(
+                    f"[TTS_STAGE] chunk={chunk_idx} model_wait_ms={model_wait_ms:.1f} "
+                    f"copy_ms={copy_ms:.1f} empty=1"
+                )
             continue
+
+        resample_start = time.perf_counter()
         wav_chunk = _resample_if_needed(wav_chunk, int(sr), DEFAULT_PARAMS["target_sr"])
+        resample_ms = (time.perf_counter() - resample_start) * 1000.0
+
+        pcm_start = time.perf_counter()
         pcm = _to_pcm16_bytes(wav_chunk)
+        pcm_ms = (time.perf_counter() - pcm_start) * 1000.0
+
+        if QWEN3_STAGE_TIMING:
+            print(
+                f"[TTS_STAGE] chunk={chunk_idx} model_wait_ms={model_wait_ms:.1f} "
+                f"copy_ms={copy_ms:.1f} resample_ms={resample_ms:.1f} "
+                f"pcm_ms={pcm_ms:.1f} sr_in={int(sr)} sr_out={DEFAULT_PARAMS['target_sr']} "
+                f"pcm_bytes={len(pcm) if pcm else 0}"
+            )
+
         if pcm:
             yield pcm
 
