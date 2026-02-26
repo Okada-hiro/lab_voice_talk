@@ -25,23 +25,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 IS_MAIN_PROCESS = mp.current_process().name == "MainProcess"
-IS_ENTRYPOINT_MAIN = __name__ == "__main__"
+GLOBAL_ASR_MODEL_INSTANCE = None
+generate_answer_stream = None
+SpeakerGuard = None
 
-# --- 必要なモジュールのインポート ---
-try:
-    if IS_ENTRYPOINT_MAIN:
-        from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
-        from new_answer_generator import generate_answer_stream
-        from new_speaker_filter import SpeakerGuard
-    else:
-        GLOBAL_ASR_MODEL_INSTANCE = None
-        generate_answer_stream = None
-        SpeakerGuard = None
-except ImportError as e:
-    if IS_MAIN_PROCESS:
-        logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
-        sys.exit(1)
-    logger.warning(f"[WARN] child process import skipped: {e}")
+
+def _lazy_import_main_modules():
+    global GLOBAL_ASR_MODEL_INSTANCE, generate_answer_stream, SpeakerGuard
+    if GLOBAL_ASR_MODEL_INSTANCE is not None and generate_answer_stream is not None and SpeakerGuard is not None:
+        return
+    from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE as _ASR
+    from new_answer_generator import generate_answer_stream as _GEN
+    from new_speaker_filter import SpeakerGuard as _SG
+    GLOBAL_ASR_MODEL_INSTANCE = _ASR
+    generate_answer_stream = _GEN
+    SpeakerGuard = _SG
 
 # --- グローバル設定 ---
 PROCESSING_DIR = "incoming_audio"
@@ -73,10 +71,11 @@ def _initialize_main_runtime_once():
     with _runtime_init_lock:
         if _runtime_inited:
             return
-        if not IS_ENTRYPOINT_MAIN:
+        if not IS_MAIN_PROCESS:
             # 子プロセスでは重い初期化を行わない
             return
 
+        _lazy_import_main_modules()
         speaker_guard = SpeakerGuard()
 
         logger.info("⏳ Loading Silero VAD model...")
@@ -101,7 +100,7 @@ def _initialize_main_runtime_once():
 
 @app.on_event("startup")
 async def _startup_init():
-    if not IS_ENTRYPOINT_MAIN:
+    if not IS_MAIN_PROCESS:
         return
     try:
         _initialize_main_runtime_once()

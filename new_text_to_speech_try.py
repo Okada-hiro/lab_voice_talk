@@ -17,6 +17,8 @@ GLOBAL_TTS_MODEL = None
 GLOBAL_VOICE_CLONE_PROMPT = None
 GLOBAL_DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 GLOBAL_TTS_TIMING_LOCK = threading.Lock()
+GLOBAL_TTS_INIT_LOCK = threading.Lock()
+GLOBAL_TTS_INIT_DONE = False
 
 # Environment-based configuration for easy deployment tuning.
 QWEN3_MODEL_PATH = os.getenv("QWEN3_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
@@ -127,6 +129,100 @@ def _apply_quantization_if_enabled(tts_model):
     print(f"[INFO] Qwen3-TTS quantization: completed {ok_count}/{len(quant_modules)} targets.")
 
 
+def _initialize_tts_once():
+    global GLOBAL_TTS_MODEL, GLOBAL_VOICE_CLONE_PROMPT, GLOBAL_TTS_INIT_DONE
+    if GLOBAL_TTS_INIT_DONE and GLOBAL_TTS_MODEL is not None and GLOBAL_VOICE_CLONE_PROMPT is not None:
+        return
+    with GLOBAL_TTS_INIT_LOCK:
+        if GLOBAL_TTS_INIT_DONE and GLOBAL_TTS_MODEL is not None and GLOBAL_VOICE_CLONE_PROMPT is not None:
+            return
+        try:
+            print("[INFO] Qwen3-TTS: loading model...")
+            if "cuda" in GLOBAL_DEVICE:
+                if QWEN3_CUDNN_BENCHMARK:
+                    torch.backends.cudnn.benchmark = True
+                    print("[INFO] Qwen3-TTS: cuDNN benchmark enabled.")
+                if QWEN3_ALLOW_TF32:
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                    torch.backends.cudnn.allow_tf32 = True
+                    print("[INFO] Qwen3-TTS: TF32 enabled.")
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision(QWEN3_MATMUL_PRECISION)
+                print(f"[INFO] Qwen3-TTS: matmul precision={QWEN3_MATMUL_PRECISION}.")
+
+            GLOBAL_TTS_MODEL = Qwen3TTSModel.from_pretrained(
+                QWEN3_MODEL_PATH,
+                device_map=GLOBAL_DEVICE,
+                dtype=_resolve_dtype(QWEN3_DTYPE),
+                attn_implementation="flash_attention_2" if "cuda" in GLOBAL_DEVICE else None,
+            )
+
+            _apply_quantization_if_enabled(GLOBAL_TTS_MODEL)
+
+            if QWEN3_USE_TORCH_COMPILE:
+                if not hasattr(torch, "compile"):
+                    print("[WARN] QWEN3_USE_TORCH_COMPILE=1 but torch.compile is unavailable on this PyTorch.")
+                else:
+                    try:
+                        if hasattr(GLOBAL_TTS_MODEL, "model") and hasattr(GLOBAL_TTS_MODEL.model, "talker"):
+                            print(
+                                "[INFO] Qwen3-TTS: enabling torch.compile on talker "
+                                f"(mode={QWEN3_TORCH_COMPILE_MODE}, dynamic={QWEN3_TORCH_COMPILE_DYNAMIC})..."
+                            )
+                            GLOBAL_TTS_MODEL.model.talker = torch.compile(
+                                GLOBAL_TTS_MODEL.model.talker,
+                                mode=QWEN3_TORCH_COMPILE_MODE,
+                                dynamic=QWEN3_TORCH_COMPILE_DYNAMIC,
+                            )
+                            print("[INFO] Qwen3-TTS: torch.compile enabled on talker.")
+                        elif hasattr(GLOBAL_TTS_MODEL, "model"):
+                            print(
+                                "[INFO] Qwen3-TTS: enabling torch.compile on root model "
+                                f"(mode={QWEN3_TORCH_COMPILE_MODE}, dynamic={QWEN3_TORCH_COMPILE_DYNAMIC})..."
+                            )
+                            GLOBAL_TTS_MODEL.model = torch.compile(
+                                GLOBAL_TTS_MODEL.model,
+                                mode=QWEN3_TORCH_COMPILE_MODE,
+                                dynamic=QWEN3_TORCH_COMPILE_DYNAMIC,
+                            )
+                            print("[INFO] Qwen3-TTS: torch.compile enabled on root model.")
+                        else:
+                            print("[WARN] Qwen3-TTS: compile target not found, skip torch.compile.")
+                    except Exception as compile_e:
+                        print(f"[WARN] Qwen3-TTS: torch.compile failed, continue without compile: {compile_e}")
+
+            if not QWEN3_REF_AUDIO:
+                raise ValueError("QWEN3_REF_AUDIO is empty. Set reference audio path for voice cloning.")
+            if (not QWEN3_XVECTOR_ONLY) and (not QWEN3_REF_TEXT):
+                raise ValueError("QWEN3_REF_TEXT is empty. Set transcript or enable QWEN3_XVECTOR_ONLY=1.")
+
+            print("[INFO] Qwen3-TTS: creating reusable voice clone prompt...")
+            GLOBAL_VOICE_CLONE_PROMPT = GLOBAL_TTS_MODEL.create_voice_clone_prompt(
+                ref_audio=QWEN3_REF_AUDIO,
+                ref_text=QWEN3_REF_TEXT if QWEN3_REF_TEXT else None,
+                x_vector_only_mode=QWEN3_XVECTOR_ONLY,
+            )
+
+            print("[INFO] Qwen3-TTS: warm-up inference...")
+            _ = GLOBAL_TTS_MODEL.generate_voice_clone(
+                text="あ",
+                language=QWEN3_LANGUAGE,
+                instruct=DEFAULT_PARAMS["instruct"],
+                voice_clone_prompt=GLOBAL_VOICE_CLONE_PROMPT,
+                do_sample=False,
+                max_new_tokens=96,
+            )
+            print("[INFO] Qwen3-TTS initialization complete.")
+            GLOBAL_TTS_INIT_DONE = True
+        except Exception as e:
+            print(f"[ERROR] Qwen3-TTS init failed: {e}")
+            traceback.print_exc()
+            GLOBAL_TTS_MODEL = None
+            GLOBAL_VOICE_CLONE_PROMPT = None
+            GLOBAL_TTS_INIT_DONE = False
+            raise
+
+
 def _to_pcm16_bytes(audio: np.ndarray) -> bytes:
     audio = np.asarray(audio, dtype=np.float32)
     audio = np.clip(audio, -1.0, 1.0)
@@ -144,6 +240,7 @@ def _resample_if_needed(audio: np.ndarray, src_sr: int, tgt_sr: int) -> np.ndarr
 
 
 def _generate_wav(text_to_speak: str, prompt_text: str = None):
+    _initialize_tts_once()
     if GLOBAL_TTS_MODEL is None:
         raise RuntimeError("Qwen3-TTS model is not initialized.")
     if GLOBAL_VOICE_CLONE_PROMPT is None:
@@ -174,6 +271,7 @@ def _generate_wav_with_timing(text_to_speak: str, prompt_text: str = None):
       - decode_ms: codec-to-waveform decode
       - total_ms: whole generate_voice_clone call
     """
+    _initialize_tts_once()
     if GLOBAL_TTS_MODEL is None:
         raise RuntimeError("Qwen3-TTS model is not initialized.")
     if GLOBAL_VOICE_CLONE_PROMPT is None:
@@ -253,6 +351,7 @@ def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = No
     Yield PCM16 bytes chunks in streaming mode.
     Requires qwen_tts implementation that supports stream_generate_voice_clone().
     """
+    _initialize_tts_once()
     if GLOBAL_TTS_MODEL is None:
         raise RuntimeError("Qwen3-TTS model is not initialized.")
     if GLOBAL_VOICE_CLONE_PROMPT is None:
@@ -338,91 +437,6 @@ def synthesize_speech_to_memory_with_timing(text_to_speak: str):
         print(f"[ERROR] Memory synthesis with timing failed: {e}")
         traceback.print_exc()
         return None, None
-
-
-try:
-    print("[INFO] Qwen3-TTS: loading model...")
-    if "cuda" in GLOBAL_DEVICE:
-        if QWEN3_CUDNN_BENCHMARK:
-            torch.backends.cudnn.benchmark = True
-            print("[INFO] Qwen3-TTS: cuDNN benchmark enabled.")
-        if QWEN3_ALLOW_TF32:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            print("[INFO] Qwen3-TTS: TF32 enabled.")
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision(QWEN3_MATMUL_PRECISION)
-        print(f"[INFO] Qwen3-TTS: matmul precision={QWEN3_MATMUL_PRECISION}.")
-
-    GLOBAL_TTS_MODEL = Qwen3TTSModel.from_pretrained(
-        QWEN3_MODEL_PATH,
-        device_map=GLOBAL_DEVICE,
-        dtype=_resolve_dtype(QWEN3_DTYPE),
-        attn_implementation="flash_attention_2" if "cuda" in GLOBAL_DEVICE else None,
-    )
-
-    _apply_quantization_if_enabled(GLOBAL_TTS_MODEL)
-
-    if QWEN3_USE_TORCH_COMPILE:
-        if not hasattr(torch, "compile"):
-            print("[WARN] QWEN3_USE_TORCH_COMPILE=1 but torch.compile is unavailable on this PyTorch.")
-        else:
-            try:
-                # Prioritize compiling talker module used in generation path.
-                if hasattr(GLOBAL_TTS_MODEL, "model") and hasattr(GLOBAL_TTS_MODEL.model, "talker"):
-                    print(
-                        "[INFO] Qwen3-TTS: enabling torch.compile on talker "
-                        f"(mode={QWEN3_TORCH_COMPILE_MODE}, dynamic={QWEN3_TORCH_COMPILE_DYNAMIC})..."
-                    )
-                    GLOBAL_TTS_MODEL.model.talker = torch.compile(
-                        GLOBAL_TTS_MODEL.model.talker,
-                        mode=QWEN3_TORCH_COMPILE_MODE,
-                        dynamic=QWEN3_TORCH_COMPILE_DYNAMIC,
-                    )
-                    print("[INFO] Qwen3-TTS: torch.compile enabled on talker.")
-                elif hasattr(GLOBAL_TTS_MODEL, "model"):
-                    print(
-                        "[INFO] Qwen3-TTS: enabling torch.compile on root model "
-                        f"(mode={QWEN3_TORCH_COMPILE_MODE}, dynamic={QWEN3_TORCH_COMPILE_DYNAMIC})..."
-                    )
-                    GLOBAL_TTS_MODEL.model = torch.compile(
-                        GLOBAL_TTS_MODEL.model,
-                        mode=QWEN3_TORCH_COMPILE_MODE,
-                        dynamic=QWEN3_TORCH_COMPILE_DYNAMIC,
-                    )
-                    print("[INFO] Qwen3-TTS: torch.compile enabled on root model.")
-                else:
-                    print("[WARN] Qwen3-TTS: compile target not found, skip torch.compile.")
-            except Exception as compile_e:
-                print(f"[WARN] Qwen3-TTS: torch.compile failed, continue without compile: {compile_e}")
-
-    if not QWEN3_REF_AUDIO:
-        raise ValueError("QWEN3_REF_AUDIO is empty. Set reference audio path for voice cloning.")
-    if (not QWEN3_XVECTOR_ONLY) and (not QWEN3_REF_TEXT):
-        raise ValueError("QWEN3_REF_TEXT is empty. Set transcript or enable QWEN3_XVECTOR_ONLY=1.")
-
-    print("[INFO] Qwen3-TTS: creating reusable voice clone prompt...")
-    GLOBAL_VOICE_CLONE_PROMPT = GLOBAL_TTS_MODEL.create_voice_clone_prompt(
-        ref_audio=QWEN3_REF_AUDIO,
-        ref_text=QWEN3_REF_TEXT if QWEN3_REF_TEXT else None,
-        x_vector_only_mode=QWEN3_XVECTOR_ONLY,
-    )
-
-    print("[INFO] Qwen3-TTS: warm-up inference...")
-    _ = GLOBAL_TTS_MODEL.generate_voice_clone(
-        text="あ",
-        language=QWEN3_LANGUAGE,
-        instruct=DEFAULT_PARAMS["instruct"],
-        voice_clone_prompt=GLOBAL_VOICE_CLONE_PROMPT,
-        do_sample=False,
-        max_new_tokens=96,
-    )
-    print("[INFO] Qwen3-TTS initialization complete.")
-except Exception as e:
-    print(f"[ERROR] Qwen3-TTS init failed: {e}")
-    traceback.print_exc()
-    GLOBAL_TTS_MODEL = None
-    GLOBAL_VOICE_CLONE_PROMPT = None
 
 
 if __name__ == "__main__":
