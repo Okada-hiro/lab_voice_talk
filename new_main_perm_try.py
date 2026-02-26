@@ -24,15 +24,23 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+IS_MAIN_PROCESS = mp.current_process().name == "MainProcess"
 
 # --- 必要なモジュールのインポート ---
 try:
-    from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
-    from new_answer_generator import generate_answer_stream
-    from new_speaker_filter import SpeakerGuard
+    if IS_MAIN_PROCESS:
+        from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
+        from new_answer_generator import generate_answer_stream
+        from new_speaker_filter import SpeakerGuard
+    else:
+        GLOBAL_ASR_MODEL_INSTANCE = None
+        generate_answer_stream = None
+        SpeakerGuard = None
 except ImportError as e:
-    logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
-    sys.exit(1)
+    if IS_MAIN_PROCESS:
+        logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
+        sys.exit(1)
+    logger.warning(f"[WARN] child process import skipped: {e}")
 
 # --- グローバル設定 ---
 PROCESSING_DIR = "incoming_audio"
@@ -43,25 +51,35 @@ logger.info(f"Using Device: {DEVICE}")
 app = FastAPI()
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 
-# SpeakerGuard初期化
-speaker_guard = SpeakerGuard()
-NEXT_AUDIO_IS_REGISTRATION = False
+if IS_MAIN_PROCESS:
+    # SpeakerGuard初期化
+    speaker_guard = SpeakerGuard()
+    NEXT_AUDIO_IS_REGISTRATION = False
 
-# --- Silero VAD のロード ---
-logger.info("⏳ Loading Silero VAD model...")
-try:
-    vad_model, utils = torch.hub.load(
-        repo_or_dir='snakers4/silero-vad',
-        model='silero_vad',
-        force_reload=False,
-        onnx=False
-    )
-    (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
-    vad_model.to(DEVICE)
-    logger.info("✅ Silero VAD model loaded.")
-except Exception as e:
-    logger.critical(f"Silero VAD Load Failed: {e}")
-    sys.exit(1)
+    # --- Silero VAD のロード ---
+    logger.info("⏳ Loading Silero VAD model...")
+    try:
+        vad_model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            onnx=False
+        )
+        (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
+        vad_model.to(DEVICE)
+        logger.info("✅ Silero VAD model loaded.")
+    except Exception as e:
+        logger.critical(f"Silero VAD Load Failed: {e}")
+        sys.exit(1)
+else:
+    speaker_guard = None
+    NEXT_AUDIO_IS_REGISTRATION = False
+    vad_model = None
+    get_speech_timestamps = None
+    save_audio = None
+    read_audio = None
+    VADIterator = None
+    collect_chunks = None
 
 
 # --- API: 登録モード切替 ---
