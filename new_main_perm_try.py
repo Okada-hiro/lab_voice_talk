@@ -29,12 +29,6 @@ logger = logging.getLogger(__name__)
 try:
     from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
     from new_answer_generator import generate_answer_stream
-    import new_text_to_speech_try as tts_module
-    from new_text_to_speech_try import (
-        synthesize_speech,
-        synthesize_speech_to_memory,
-        synthesize_speech_to_memory_stream,
-    )
     from new_speaker_filter import SpeakerGuard
 except ImportError as e:
     logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
@@ -297,10 +291,16 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     llm_tts_start = time.perf_counter()
     STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
     STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
-    stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
-    if isinstance(stream_cfg, dict):
-        stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
-        stream_cfg["decode_window_frames"] = STREAM_DECODE_WINDOW_FRAMES
+    stream_cfg = {
+        "emit_every_frames": STREAM_EMIT_EVERY_FRAMES,
+        "decode_window_frames": STREAM_DECODE_WINDOW_FRAMES,
+        "overlap_samples": 512,
+        "first_chunk_emit_every": 0,
+        "first_chunk_decode_window": 48,
+        "first_chunk_frames": 48,
+        "repetition_penalty": 1.0,
+        "repetition_penalty_window": 100,
+    }
     logger.info(
         "[TTS_CONFIG] "
         f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
@@ -324,7 +324,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     first_audio_sent_at = None
     sent_arrival_seq = 0
 
-    mp_start_method = os.getenv("PERM_TTS_MP_START_METHOD", "fork")
+    mp_start_method = os.getenv("PERM_TTS_MP_START_METHOD", "spawn")
     ctx = mp.get_context(mp_start_method)
     tts_in_q = ctx.Queue(maxsize=64)
     tts_out_q = ctx.Queue(maxsize=128)
