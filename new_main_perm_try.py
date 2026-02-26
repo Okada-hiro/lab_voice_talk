@@ -60,6 +60,9 @@ VADIterator = None
 collect_chunks = None
 _runtime_inited = False
 _runtime_init_lock = threading.Lock()
+_tts_proc_ctx = None
+_tts_proc_lock = threading.Lock()
+_tts_request_lock = asyncio.Lock()
 
 
 def _initialize_main_runtime_once():
@@ -104,9 +107,21 @@ async def _startup_init():
         return
     try:
         _initialize_main_runtime_once()
+        tctx = _ensure_tts_process()
+        try:
+            tctx["in_q"].put_nowait({"type": "warmup"})
+        except Exception:
+            pass
     except Exception as e:
         logger.critical(f"Main runtime initialization failed: {e}")
         raise
+
+
+@app.on_event("shutdown")
+async def _shutdown_cleanup():
+    if not IS_MAIN_PROCESS:
+        return
+    _shutdown_tts_process()
 
 
 # --- API: 登録モード切替 ---
@@ -239,6 +254,22 @@ def _tts_process_main(input_q, output_q, stream_emit_frames: int, stream_decode_
         if not task or task.get("type") == "stop":
             output_q.put({"type": "stop"})
             return
+        if task.get("type") == "warmup":
+            try:
+                if hasattr(_tts, "_initialize_tts_once"):
+                    _tts._initialize_tts_once()
+                else:
+                    _ = _tts.synthesize_speech_to_memory("あ")
+                output_q.put({"type": "proc_log", "message": "[TTS_PROC] warmup_done"})
+            except Exception as e:
+                output_q.put(
+                    {
+                        "type": "proc_error",
+                        "message": f"[TTS_PROC] warmup_failed: {e}",
+                        "trace": traceback.format_exc(),
+                    }
+                )
+            continue
 
         idx = task["sentence_idx"]
         phrase = task["text"]
@@ -328,88 +359,154 @@ def _tts_process_main(input_q, output_q, stream_emit_frames: int, stream_decode_
         )
 
 
+def _ensure_tts_process():
+    global _tts_proc_ctx
+    if _tts_proc_ctx is not None and _tts_proc_ctx["proc"].is_alive():
+        return _tts_proc_ctx
+
+    with _tts_proc_lock:
+        if _tts_proc_ctx is not None and _tts_proc_ctx["proc"].is_alive():
+            return _tts_proc_ctx
+
+        stream_emit = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
+        stream_decode = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
+        mp_start_method = os.getenv("PERM_TTS_MP_START_METHOD", "spawn")
+        ctx = mp.get_context(mp_start_method)
+        in_q = ctx.Queue(maxsize=128)
+        out_q = ctx.Queue(maxsize=256)
+        proc = ctx.Process(
+            target=_tts_process_main,
+            args=(in_q, out_q, stream_emit, stream_decode),
+            daemon=True,
+        )
+        proc.start()
+        _tts_proc_ctx = {"proc": proc, "in_q": in_q, "out_q": out_q}
+        logger.info(f"[TTS_PROC] started pid={proc.pid} start_method={mp_start_method}")
+        return _tts_proc_ctx
+
+
+def _shutdown_tts_process():
+    global _tts_proc_ctx
+    if _tts_proc_ctx is None:
+        return
+    proc = _tts_proc_ctx["proc"]
+    in_q = _tts_proc_ctx["in_q"]
+    try:
+        in_q.put_nowait({"type": "stop"})
+    except Exception:
+        pass
+    proc.join(timeout=3.0)
+    if proc.is_alive():
+        logger.warning(f"[TTS_PROC] terminate pid={proc.pid}")
+        proc.terminate()
+    _tts_proc_ctx = None
+
+
 async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: list):
-    text_buffer = ""
-    sentence_count = 0
-    full_answer = ""
-    split_pattern = r'(?<=[。！？\n])'
-    llm_tts_start = time.perf_counter()
-    STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
-    STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
-    stream_cfg = {
-        "emit_every_frames": STREAM_EMIT_EVERY_FRAMES,
-        "decode_window_frames": STREAM_DECODE_WINDOW_FRAMES,
-        "overlap_samples": 512,
-        "first_chunk_emit_every": 0,
-        "first_chunk_decode_window": 48,
-        "first_chunk_frames": 48,
-        "repetition_penalty": 1.0,
-        "repetition_penalty_window": 100,
-    }
-    logger.info(
-        "[TTS_CONFIG] "
-        f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
-        f"decode_window_frames={stream_cfg.get('decode_window_frames')} "
-        f"overlap_samples={stream_cfg.get('overlap_samples')} "
-        f"first_chunk_emit_every={stream_cfg.get('first_chunk_emit_every')} "
-        f"first_chunk_decode_window={stream_cfg.get('first_chunk_decode_window')} "
-        f"first_chunk_frames={stream_cfg.get('first_chunk_frames')} "
-        f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
-        f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
-        "tts_workers=proc prefetch_ahead=0"
-    )
-    logger.info(
-        f"[LLM_TTS_FLOW] start text_for_llm_len={len(text_for_llm)} "
-        f"history_len={len(chat_history)} split_pattern={split_pattern}"
-    )
+    async with _tts_request_lock:
+        text_buffer = ""
+        sentence_count = 0
+        full_answer = ""
+        split_pattern = r'(?<=[。！？\n])'
+        llm_tts_start = time.perf_counter()
+        stream_emit = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
+        stream_decode = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
+        stream_cfg = {
+            "emit_every_frames": stream_emit,
+            "decode_window_frames": stream_decode,
+            "overlap_samples": 512,
+            "first_chunk_emit_every": 0,
+            "first_chunk_decode_window": 48,
+            "first_chunk_frames": 48,
+            "repetition_penalty": 1.0,
+            "repetition_penalty_window": 100,
+        }
+        logger.info(
+            "[TTS_CONFIG] "
+            f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
+            f"decode_window_frames={stream_cfg.get('decode_window_frames')} "
+            f"overlap_samples={stream_cfg.get('overlap_samples')} "
+            f"first_chunk_emit_every={stream_cfg.get('first_chunk_emit_every')} "
+            f"first_chunk_decode_window={stream_cfg.get('first_chunk_decode_window')} "
+            f"first_chunk_frames={stream_cfg.get('first_chunk_frames')} "
+            f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
+            f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
+            "tts_workers=proc prefetch_ahead=0"
+        )
+        logger.info(
+            f"[LLM_TTS_FLOW] start text_for_llm_len={len(text_for_llm)} "
+            f"history_len={len(chat_history)} split_pattern={split_pattern}"
+        )
 
-    iterator = generate_answer_stream(text_for_llm, history=chat_history)
-    SAMPLE_RATE = 16000
-    audio_queue = asyncio.Queue()
-    first_audio_sent_at = None
-    sent_arrival_seq = 0
+        tctx = _ensure_tts_process()
+        tts_in_q = tctx["in_q"]
+        tts_out_q = tctx["out_q"]
+        iterator = generate_answer_stream(text_for_llm, history=chat_history)
+        first_audio_sent_at = None
+        sent_arrival_seq = 0
 
-    mp_start_method = os.getenv("PERM_TTS_MP_START_METHOD", "spawn")
-    ctx = mp.get_context(mp_start_method)
-    tts_in_q = ctx.Queue(maxsize=64)
-    tts_out_q = ctx.Queue(maxsize=128)
-    tts_proc = ctx.Process(
-        target=_tts_process_main,
-        args=(tts_in_q, tts_out_q, STREAM_EMIT_EVERY_FRAMES, STREAM_DECODE_WINDOW_FRAMES),
-        daemon=True,
-    )
-    tts_proc.start()
-    logger.info(f"[TTS_PROC] started pid={tts_proc.pid}")
-
-    loop = asyncio.get_running_loop()
-    bridge_stop = threading.Event()
-
-    def _bridge_out_queue():
-        while not bridge_stop.is_set():
-            try:
-                item = tts_out_q.get(timeout=0.2)
-            except pyqueue.Empty:
-                if not tts_proc.is_alive():
-                    loop.call_soon_threadsafe(audio_queue.put_nowait, {"type": "stop"})
+        try:
+            for chunk in iterator:
+                text_buffer += chunk
+                full_answer += chunk
+                logger.info(
+                    f"[LLM_STREAM] got_chunk len={len(chunk)} "
+                    f"buffer_len={len(text_buffer)} full_len={len(full_answer)}"
+                )
+                if full_answer.strip() == "[SILENCE]":
+                    await websocket.send_json(
+                        {
+                            "status": "system_alert",
+                            "message": "⚠️ 会話外の音声と判断しました。会話を続けてください。",
+                            "alert_type": "irrelevant",
+                        }
+                    )
                     return
-                continue
-            loop.call_soon_threadsafe(audio_queue.put_nowait, item)
-            if item.get("type") == "stop":
-                return
 
-    bridge_thread = threading.Thread(target=_bridge_out_queue, daemon=True)
-    bridge_thread.start()
+                sentences = re.split(split_pattern, text_buffer)
+                if len(sentences) > 1:
+                    logger.info(
+                        f"[LLM_STREAM] sentence_split count={len(sentences)-1} "
+                        f"tail_len={len(sentences[-1])}"
+                    )
+                    for sent in sentences[:-1]:
+                        if sent.strip():
+                            sentence_count += 1
+                            await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
+                            tts_in_q.put(
+                                {
+                                    "type": "synthesize",
+                                    "sentence_idx": sentence_count,
+                                    "text": sent,
+                                    "queued_at": time.perf_counter(),
+                                }
+                            )
+                            logger.info(
+                                f"[LLM_STREAM] enqueued sentence={sentence_count} len={len(sent)} "
+                                "target=tts_process"
+                            )
+                    text_buffer = sentences[-1]
 
-    async def audio_sender_worker():
-        nonlocal first_audio_sent_at, sent_arrival_seq
-        logger.info("[AUDIO_SENDER] started")
-        while True:
-            item = await audio_queue.get()
-            try:
+            if text_buffer.strip():
+                sentence_count += 1
+                await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
+                tts_in_q.put(
+                    {
+                        "type": "synthesize",
+                        "sentence_idx": sentence_count,
+                        "text": text_buffer,
+                        "queued_at": time.perf_counter(),
+                    }
+                )
+                logger.info(
+                    f"[LLM_STREAM] enqueued tail sentence={sentence_count} len={len(text_buffer)} "
+                    "target=tts_process"
+                )
+
+            done_count = 0
+            while done_count < sentence_count:
+                item = await asyncio.to_thread(tts_out_q.get)
                 typ = item.get("type")
-                if typ == "stop":
-                    logger.info("[AUDIO_SENDER] got_stop -> exit")
-                    return
                 if typ == "proc_ready":
                     logger.info(f"[TTS_PROC] ready pid={item.get('pid')}")
                     continue
@@ -434,7 +531,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                             "chunk_id": tts_chunk_idx,
                             "arrival_seq": sent_arrival_seq,
                             "byte_len": len(audio_bytes),
-                            "sample_rate": SAMPLE_RATE,
+                            "sample_rate": 16000,
                         }
                     )
                     await websocket.send_bytes(audio_bytes)
@@ -449,6 +546,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         f"queue_to_send_ms={queue_to_send_ms:.1f} send_ms={send_ms:.1f}"
                     )
                 elif typ == "done":
+                    done_count += 1
                     await websocket.send_json(
                         {
                             "status": "audio_sentence_done",
@@ -464,96 +562,16 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         f"total_tts_ms={item.get('total_tts_ms', 0.0):.1f} "
                         f"tts_chunk_count={item.get('tts_chunk_idx', 0)}"
                     )
-            finally:
-                audio_queue.task_done()
 
-    sender_task = asyncio.create_task(audio_sender_worker())
-
-    try:
-        for chunk in iterator:
-            text_buffer += chunk
-            full_answer += chunk
+            chat_history.append({"role": "user", "parts": [text_for_llm]})
+            chat_history.append({"role": "model", "parts": [full_answer]})
+            await websocket.send_json({"status": "complete", "answer_text": full_answer})
             logger.info(
-                f"[LLM_STREAM] got_chunk len={len(chunk)} "
-                f"buffer_len={len(text_buffer)} full_len={len(full_answer)}"
+                f"[LLM_TTS_FLOW] complete answer_len={len(full_answer)} "
+                f"total_llm_tts_ms={(time.perf_counter() - llm_tts_start)*1000.0:.1f}"
             )
-            if full_answer.strip() == "[SILENCE]":
-                await websocket.send_json(
-                    {
-                        "status": "system_alert",
-                        "message": "⚠️ 会話外の音声と判断しました。会話を続けてください。",
-                        "alert_type": "irrelevant",
-                    }
-                )
-                return
-
-            sentences = re.split(split_pattern, text_buffer)
-            if len(sentences) > 1:
-                logger.info(
-                    f"[LLM_STREAM] sentence_split count={len(sentences)-1} "
-                    f"tail_len={len(sentences[-1])}"
-                )
-                for sent in sentences[:-1]:
-                    if sent.strip():
-                        sentence_count += 1
-                        await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
-                        tts_in_q.put(
-                            {
-                                "type": "synthesize",
-                                "sentence_idx": sentence_count,
-                                "text": sent,
-                                "queued_at": time.perf_counter(),
-                            }
-                        )
-                        logger.info(
-                            f"[LLM_STREAM] enqueued sentence={sentence_count} len={len(sent)} "
-                            "target=tts_process"
-                        )
-                text_buffer = sentences[-1]
-
-        if text_buffer.strip():
-            sentence_count += 1
-            await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
-            tts_in_q.put(
-                {
-                    "type": "synthesize",
-                    "sentence_idx": sentence_count,
-                    "text": text_buffer,
-                    "queued_at": time.perf_counter(),
-                }
-            )
-            logger.info(
-                f"[LLM_STREAM] enqueued tail sentence={sentence_count} len={len(text_buffer)} "
-                "target=tts_process"
-            )
-
-        logger.info("[LLM_STREAM] iterator_done -> sending stop signal to tts_process")
-        tts_in_q.put({"type": "stop"})
-        await sender_task
-
-        chat_history.append({"role": "user", "parts": [text_for_llm]})
-        chat_history.append({"role": "model", "parts": [full_answer]})
-        await websocket.send_json({"status": "complete", "answer_text": full_answer})
-        logger.info(
-            f"[LLM_TTS_FLOW] complete answer_len={len(full_answer)} "
-            f"total_llm_tts_ms={(time.perf_counter() - llm_tts_start)*1000.0:.1f}"
-        )
-    except Exception as e:
-        logger.error(f"LLM/TTS Error: {e}", exc_info=True)
-    finally:
-        bridge_stop.set()
-        if tts_proc.is_alive():
-            try:
-                tts_in_q.put_nowait({"type": "stop"})
-            except Exception:
-                pass
-            tts_proc.join(timeout=3.0)
-            if tts_proc.is_alive():
-                logger.warning(f"[TTS_PROC] terminate pid={tts_proc.pid}")
-                tts_proc.terminate()
-        bridge_thread.join(timeout=1.0)
-        if not sender_task.done():
-            sender_task.cancel()
+        except Exception as e:
+            logger.error(f"LLM/TTS Error: {e}", exc_info=True)
 
 
 # ---------------------------
