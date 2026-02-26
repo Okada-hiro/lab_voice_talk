@@ -25,10 +25,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 IS_MAIN_PROCESS = mp.current_process().name == "MainProcess"
+IS_ENTRYPOINT_MAIN = __name__ == "__main__"
 
 # --- 必要なモジュールのインポート ---
 try:
-    if IS_MAIN_PROCESS:
+    if IS_ENTRYPOINT_MAIN:
         from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
         from new_answer_generator import generate_answer_stream
         from new_speaker_filter import SpeakerGuard
@@ -51,35 +52,62 @@ logger.info(f"Using Device: {DEVICE}")
 app = FastAPI()
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 
-if IS_MAIN_PROCESS:
-    # SpeakerGuard初期化
-    speaker_guard = SpeakerGuard()
-    NEXT_AUDIO_IS_REGISTRATION = False
+speaker_guard = None
+NEXT_AUDIO_IS_REGISTRATION = False
+vad_model = None
+get_speech_timestamps = None
+save_audio = None
+read_audio = None
+VADIterator = None
+collect_chunks = None
+_runtime_inited = False
+_runtime_init_lock = threading.Lock()
 
-    # --- Silero VAD のロード ---
-    logger.info("⏳ Loading Silero VAD model...")
-    try:
-        vad_model, utils = torch.hub.load(
+
+def _initialize_main_runtime_once():
+    global _runtime_inited
+    global speaker_guard, vad_model
+    global get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks
+    if _runtime_inited:
+        return
+    with _runtime_init_lock:
+        if _runtime_inited:
+            return
+        if not IS_ENTRYPOINT_MAIN:
+            # 子プロセスでは重い初期化を行わない
+            return
+
+        speaker_guard = SpeakerGuard()
+
+        logger.info("⏳ Loading Silero VAD model...")
+        vad_model_local, utils = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad',
             force_reload=False,
             onnx=False
         )
-        (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
-        vad_model.to(DEVICE)
+        (gst, sa, ra, vadi, cc) = utils
+        vad_model_local.to(DEVICE)
+        vad_model = vad_model_local
+        get_speech_timestamps = gst
+        save_audio = sa
+        read_audio = ra
+        VADIterator = vadi
+        collect_chunks = cc
         logger.info("✅ Silero VAD model loaded.")
+
+        _runtime_inited = True
+
+
+@app.on_event("startup")
+async def _startup_init():
+    if not IS_ENTRYPOINT_MAIN:
+        return
+    try:
+        _initialize_main_runtime_once()
     except Exception as e:
-        logger.critical(f"Silero VAD Load Failed: {e}")
-        sys.exit(1)
-else:
-    speaker_guard = None
-    NEXT_AUDIO_IS_REGISTRATION = False
-    vad_model = None
-    get_speech_timestamps = None
-    save_audio = None
-    read_audio = None
-    VADIterator = None
-    collect_chunks = None
+        logger.critical(f"Main runtime initialization failed: {e}")
+        raise
 
 
 # --- API: 登録モード切替 ---
@@ -534,6 +562,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
 # ---------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    _initialize_main_runtime_once()
     await websocket.accept()
     logger.info("[WS] Client Connected.")
     
