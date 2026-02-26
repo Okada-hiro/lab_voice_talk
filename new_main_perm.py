@@ -190,9 +190,11 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     TTS_WORKER_COUNT = 1
     TTS_PREFETCH_AHEAD = 1
     STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
+    STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
     if isinstance(stream_cfg, dict):
         stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
+        stream_cfg["decode_window_frames"] = STREAM_DECODE_WINDOW_FRAMES
     logger.info(
         "[TTS_CONFIG] "
         f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
