@@ -29,6 +29,8 @@ QWEN3_STAGE_TIMING = os.getenv("QWEN3_STAGE_TIMING", "0") == "1"
 QWEN3_USE_TORCH_COMPILE = os.getenv("QWEN3_USE_TORCH_COMPILE", "0") == "1"
 QWEN3_TORCH_COMPILE_MODE = os.getenv("QWEN3_TORCH_COMPILE_MODE", "reduce-overhead")
 QWEN3_TORCH_COMPILE_DYNAMIC = os.getenv("QWEN3_TORCH_COMPILE_DYNAMIC", "0") == "1"
+QWEN3_QUANT_MODE = os.getenv("QWEN3_QUANT_MODE", "none").strip().lower()
+QWEN3_QUANT_TARGETS = os.getenv("QWEN3_QUANT_TARGETS", "talker,code_predictor")
 
 DEFAULT_PARAMS = {
     "instruct": "人間らしく、感情豊かに、自然な息遣いで話してください。文末をはっきりと発音すること！",
@@ -63,6 +65,63 @@ def _resolve_dtype(name: str):
     if key == "float16":
         return torch.float16
     return torch.float32
+
+
+def _resolve_quant_targets():
+    targets = []
+    for raw in QWEN3_QUANT_TARGETS.split(","):
+        key = raw.strip().lower()
+        if key:
+            targets.append(key)
+    return targets
+
+
+def _find_quant_modules(tts_model):
+    modules = []
+    if not hasattr(tts_model, "model"):
+        return modules
+
+    base = tts_model.model
+    for target in _resolve_quant_targets():
+        if target == "talker" and hasattr(base, "talker"):
+            modules.append(("talker", base.talker))
+        elif target == "code_predictor" and hasattr(base, "code_predictor"):
+            modules.append(("code_predictor", base.code_predictor))
+        elif target == "model":
+            modules.append(("model", base))
+    return modules
+
+
+def _apply_quantization_if_enabled(tts_model):
+    if QWEN3_QUANT_MODE in ("", "none", "off", "false", "0"):
+        print("[INFO] Qwen3-TTS quantization: disabled (QWEN3_QUANT_MODE=none).")
+        return
+
+    if QWEN3_QUANT_MODE != "int8":
+        print(f"[WARN] Qwen3-TTS quantization: unknown mode '{QWEN3_QUANT_MODE}', skip.")
+        return
+
+    quant_modules = _find_quant_modules(tts_model)
+    if not quant_modules:
+        print("[WARN] Qwen3-TTS quantization: no target modules found, skip.")
+        return
+
+    try:
+        from torchao.quantization import int8_weight_only, quantize_
+    except Exception as e:
+        print(f"[WARN] Qwen3-TTS quantization: torchao unavailable, skip int8 ({e}).")
+        return
+
+    print(f"[INFO] Qwen3-TTS quantization: mode=int8 targets={','.join(name for name, _ in quant_modules)}")
+    ok_count = 0
+    for name, module in quant_modules:
+        try:
+            quantize_(module, int8_weight_only())
+            ok_count += 1
+            print(f"[INFO] Qwen3-TTS quantization: applied int8 to '{name}'.")
+        except Exception as e:
+            print(f"[WARN] Qwen3-TTS quantization: failed on '{name}', keep fp path ({e}).")
+    print(f"[INFO] Qwen3-TTS quantization: completed {ok_count}/{len(quant_modules)} targets.")
 
 
 def _to_pcm16_bytes(audio: np.ndarray) -> bytes:
@@ -286,6 +345,8 @@ try:
         dtype=_resolve_dtype(QWEN3_DTYPE),
         attn_implementation="flash_attention_2" if "cuda" in GLOBAL_DEVICE else None,
     )
+
+    _apply_quantization_if_enabled(GLOBAL_TTS_MODEL)
 
     if QWEN3_USE_TORCH_COMPILE:
         if not hasattr(torch, "compile"):
