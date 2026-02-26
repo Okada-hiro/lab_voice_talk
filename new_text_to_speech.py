@@ -26,6 +26,9 @@ QWEN3_LANGUAGE = os.getenv("QWEN3_LANGUAGE", "Japanese")
 QWEN3_DTYPE = os.getenv("QWEN3_DTYPE", "bfloat16")
 QWEN3_XVECTOR_ONLY = os.getenv("QWEN3_XVECTOR_ONLY", "0") == "1"
 QWEN3_STAGE_TIMING = os.getenv("QWEN3_STAGE_TIMING", "0") == "1"
+QWEN3_USE_TORCH_COMPILE = os.getenv("QWEN3_USE_TORCH_COMPILE", "0") == "1"
+QWEN3_TORCH_COMPILE_MODE = os.getenv("QWEN3_TORCH_COMPILE_MODE", "reduce-overhead")
+QWEN3_TORCH_COMPILE_DYNAMIC = os.getenv("QWEN3_TORCH_COMPILE_DYNAMIC", "0") == "1"
 
 DEFAULT_PARAMS = {
     "instruct": "人間らしく、感情豊かに、自然な息遣いで話してください。文末をはっきりと発音すること！",
@@ -283,6 +286,39 @@ try:
         dtype=_resolve_dtype(QWEN3_DTYPE),
         attn_implementation="flash_attention_2" if "cuda" in GLOBAL_DEVICE else None,
     )
+
+    if QWEN3_USE_TORCH_COMPILE:
+        if not hasattr(torch, "compile"):
+            print("[WARN] QWEN3_USE_TORCH_COMPILE=1 but torch.compile is unavailable on this PyTorch.")
+        else:
+            try:
+                # Prioritize compiling talker module used in generation path.
+                if hasattr(GLOBAL_TTS_MODEL, "model") and hasattr(GLOBAL_TTS_MODEL.model, "talker"):
+                    print(
+                        "[INFO] Qwen3-TTS: enabling torch.compile on talker "
+                        f"(mode={QWEN3_TORCH_COMPILE_MODE}, dynamic={QWEN3_TORCH_COMPILE_DYNAMIC})..."
+                    )
+                    GLOBAL_TTS_MODEL.model.talker = torch.compile(
+                        GLOBAL_TTS_MODEL.model.talker,
+                        mode=QWEN3_TORCH_COMPILE_MODE,
+                        dynamic=QWEN3_TORCH_COMPILE_DYNAMIC,
+                    )
+                    print("[INFO] Qwen3-TTS: torch.compile enabled on talker.")
+                elif hasattr(GLOBAL_TTS_MODEL, "model"):
+                    print(
+                        "[INFO] Qwen3-TTS: enabling torch.compile on root model "
+                        f"(mode={QWEN3_TORCH_COMPILE_MODE}, dynamic={QWEN3_TORCH_COMPILE_DYNAMIC})..."
+                    )
+                    GLOBAL_TTS_MODEL.model = torch.compile(
+                        GLOBAL_TTS_MODEL.model,
+                        mode=QWEN3_TORCH_COMPILE_MODE,
+                        dynamic=QWEN3_TORCH_COMPILE_DYNAMIC,
+                    )
+                    print("[INFO] Qwen3-TTS: torch.compile enabled on root model.")
+                else:
+                    print("[WARN] Qwen3-TTS: compile target not found, skip torch.compile.")
+            except Exception as compile_e:
+                print(f"[WARN] Qwen3-TTS: torch.compile failed, continue without compile: {compile_e}")
 
     if not QWEN3_REF_AUDIO:
         raise ValueError("QWEN3_REF_AUDIO is empty. Set reference audio path for voice cloning.")
