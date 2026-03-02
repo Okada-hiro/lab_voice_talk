@@ -1,7 +1,7 @@
 #今はこれ! 2月20日 一旦安定する
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import torch
@@ -42,6 +42,10 @@ PROCESSING_DIR = "incoming_audio"
 os.makedirs(PROCESSING_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using Device: {DEVICE}")
+SYNC_ROOT_DIR = os.path.abspath(os.getenv("RUNPOD_SYNC_ROOT", "."))
+SYNC_TOKEN = os.getenv("RUNPOD_SYNC_TOKEN", "").strip()
+os.makedirs(SYNC_ROOT_DIR, exist_ok=True)
+logger.info(f"[SYNC] root={SYNC_ROOT_DIR}")
 
 app = FastAPI()
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
@@ -74,6 +78,40 @@ async def enable_registration():
     NEXT_AUDIO_IS_REGISTRATION = True
     logger.info("【モード切替】次の発話を新規話者として登録します")
     return {"message": "登録モード待機中"}
+
+
+def _verify_sync_token(token: str | None):
+    if not SYNC_TOKEN:
+        raise HTTPException(status_code=503, detail="Sync token is not configured on server.")
+    if token != SYNC_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid sync token.")
+
+
+def _resolve_sync_path(relative_path: str) -> str:
+    rel = (relative_path or "").strip()
+    if not rel:
+        raise HTTPException(status_code=400, detail="relative_path is required.")
+    rel = rel.lstrip("/").replace("\\", "/")
+    full = os.path.abspath(os.path.join(SYNC_ROOT_DIR, rel))
+    if not full.startswith(SYNC_ROOT_DIR + os.sep) and full != SYNC_ROOT_DIR:
+        raise HTTPException(status_code=400, detail="Path traversal is not allowed.")
+    return full
+
+
+@app.post("/admin/upload-file")
+async def upload_file(
+    relative_path: str = Form(...),
+    file: UploadFile = File(...),
+    x_sync_token: str | None = Header(default=None),
+):
+    _verify_sync_token(x_sync_token)
+    target_path = _resolve_sync_path(relative_path)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    data = await file.read()
+    with open(target_path, "wb") as f:
+        f.write(data)
+    logger.info(f"[SYNC] uploaded: {target_path} ({len(data)} bytes)")
+    return {"ok": True, "path": target_path, "bytes": len(data)}
 
 
 # --- ヘルパー: 音声処理パイプライン ---
