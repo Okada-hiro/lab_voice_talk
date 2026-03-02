@@ -13,9 +13,6 @@ import os
 import io
 import re
 import time
-import threading
-import multiprocessing as mp
-import queue as pyqueue
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -24,42 +21,21 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
-IS_MAIN_PROCESS = mp.current_process().name == "MainProcess"
-GLOBAL_ASR_MODEL_INSTANCE = None
-generate_answer_stream = None
-SpeakerGuard = None
 
-
-def _lazy_import_main_modules():
-    global GLOBAL_ASR_MODEL_INSTANCE, generate_answer_stream, SpeakerGuard
-    if GLOBAL_ASR_MODEL_INSTANCE is not None and generate_answer_stream is not None and SpeakerGuard is not None:
-        return
-    from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE as _ASR
-    from new_answer_generator import generate_answer_stream as _GEN
-    from new_speaker_filter import SpeakerGuard as _SG
-    GLOBAL_ASR_MODEL_INSTANCE = _ASR
-    generate_answer_stream = _GEN
-    SpeakerGuard = _SG
-
-
-async def _safe_send_json(websocket: WebSocket, payload: dict) -> bool:
-    try:
-        await websocket.send_json(payload)
-        return True
-    except (WebSocketDisconnect, RuntimeError):
-        return False
-    except Exception:
-        return False
-
-
-async def _safe_send_bytes(websocket: WebSocket, payload: bytes) -> bool:
-    try:
-        await websocket.send_bytes(payload)
-        return True
-    except (WebSocketDisconnect, RuntimeError):
-        return False
-    except Exception:
-        return False
+# --- 必要なモジュールのインポート ---
+try:
+    from transcribe_func import GLOBAL_ASR_MODEL_INSTANCE
+    from new_answer_generator import generate_answer_stream
+    import faster_text_to_speech as tts_module
+    from faster_text_to_speech import (
+        synthesize_speech,
+        synthesize_speech_to_memory,
+        synthesize_speech_to_memory_stream,
+    )
+    from new_speaker_filter import SpeakerGuard
+except ImportError as e:
+    logger.error(f"[ERROR] 必要なモジュールが見つかりません: {e}")
+    sys.exit(1)
 
 # --- グローバル設定 ---
 PROCESSING_DIR = "incoming_audio"
@@ -70,78 +46,25 @@ logger.info(f"Using Device: {DEVICE}")
 app = FastAPI()
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 
-speaker_guard = None
+# SpeakerGuard初期化
+speaker_guard = SpeakerGuard()
 NEXT_AUDIO_IS_REGISTRATION = False
-vad_model = None
-get_speech_timestamps = None
-save_audio = None
-read_audio = None
-VADIterator = None
-collect_chunks = None
-_runtime_inited = False
-_runtime_init_lock = threading.Lock()
-_tts_proc_ctx = None
-_tts_proc_lock = threading.Lock()
-_tts_request_lock = asyncio.Lock()
 
-
-def _initialize_main_runtime_once():
-    global _runtime_inited
-    global speaker_guard, vad_model
-    global get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks
-    if _runtime_inited:
-        return
-    with _runtime_init_lock:
-        if _runtime_inited:
-            return
-        if not IS_MAIN_PROCESS:
-            # 子プロセスでは重い初期化を行わない
-            return
-
-        _lazy_import_main_modules()
-        speaker_guard = SpeakerGuard()
-
-        logger.info("⏳ Loading Silero VAD model...")
-        vad_model_local, utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            force_reload=False,
-            onnx=False
-        )
-        (gst, sa, ra, vadi, cc) = utils
-        vad_model_local.to(DEVICE)
-        vad_model = vad_model_local
-        get_speech_timestamps = gst
-        save_audio = sa
-        read_audio = ra
-        VADIterator = vadi
-        collect_chunks = cc
-        logger.info("✅ Silero VAD model loaded.")
-
-        _runtime_inited = True
-
-
-@app.on_event("startup")
-async def _startup_init():
-    if not IS_MAIN_PROCESS:
-        return
-    try:
-        _initialize_main_runtime_once()
-        tctx = _ensure_tts_process()
-        try:
-            tctx["in_q"].put_nowait({"type": "warmup"})
-        except Exception:
-            pass
-    except Exception as e:
-        logger.critical(f"Main runtime initialization failed: {e}")
-        raise
-
-
-@app.on_event("shutdown")
-async def _shutdown_cleanup():
-    if not IS_MAIN_PROCESS:
-        return
-    _shutdown_tts_process()
+# --- Silero VAD のロード ---
+logger.info("⏳ Loading Silero VAD model...")
+try:
+    vad_model, utils = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad',
+        model='silero_vad',
+        force_reload=False,
+        onnx=False
+    )
+    (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
+    vad_model.to(DEVICE)
+    logger.info("✅ Silero VAD model loaded.")
+except Exception as e:
+    logger.critical(f"Silero VAD Load Failed: {e}")
+    sys.exit(1)
 
 
 # --- API: 登録モード切替 ---
@@ -188,10 +111,9 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         if new_id:
             speaker_id = new_id
             is_allowed = True
-            if not await _safe_send_json(websocket, {"status": "system_info", "message": f"✅ {new_id} を登録しました！会話を続けます。"}):
-                return
+            await websocket.send_json({"status": "system_info", "message": f"✅ {new_id} を登録しました！会話を続けます。"})
         else:
-            await _safe_send_json(websocket, {"status": "error", "message": "登録に失敗しました"})
+            await websocket.send_json({"status": "error", "message": "登録に失敗しました"})
             return
             
     else:
@@ -209,16 +131,15 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         # 警告を出さずに「無視」する。
         if duration_sec < 2.5:
             logger.info(f"[Ignored] Short audio ({duration_sec:.2f}s) failed auth. Treating as noise.")
-            await _safe_send_json(websocket, {"status": "ignored", "message": "..."})
+            await websocket.send_json({"status": "ignored", "message": "..."})
             return
 
         logger.info("[Access Denied] 登録されていない話者です。")
-        if not await _safe_send_json(websocket, {
+        await websocket.send_json({
             "status": "system_alert", 
             "message": "⚠️ 外部の会話(未登録)を検知しました。ユーザーとして追加する場合は「メンバー追加」から行ってください。",
             "alert_type": "unregistered" 
-        }):
-            return
+        })
         return
 
     # ---------------------------
@@ -243,12 +164,11 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
         text_with_context = f"【{speaker_id}】 {text}"
         logger.info(f"[TASK] {text_with_context}")
 
-        if not await _safe_send_json(websocket, {
+        await websocket.send_json({
             "status": "transcribed",
             "question_text": text,
             "speaker_id": speaker_id 
-        }):
-            return
+        })
 
         # ---------------------------
         # 4. LLM & TTS ストリーミング
@@ -257,339 +177,246 @@ async def process_voice_pipeline(audio_float32_np, websocket: WebSocket, chat_hi
 
     except Exception as e:
         logger.error(f"Pipeline Error: {e}", exc_info=True)
-        await _safe_send_json(websocket, {"status": "error", "message": "処理エラー"})
+        await websocket.send_json({"status": "error", "message": "処理エラー"})
 
 
 # --- ヘルパー: 回答生成と音声合成 ---
-def _tts_process_main(input_q, output_q, stream_emit_frames: int, stream_decode_window: int):
-    import traceback
-    import time as _time
-    import new_text_to_speech_try as _tts
-
-    stream_cfg = getattr(_tts, "DEFAULT_STREAM_PARAMS", {})
-    if isinstance(stream_cfg, dict):
-        stream_cfg["emit_every_frames"] = stream_emit_frames
-        stream_cfg["decode_window_frames"] = stream_decode_window
-
-    output_q.put({"type": "proc_ready", "pid": os.getpid()})
-    while True:
-        task = input_q.get()
-        if not task or task.get("type") == "stop":
-            output_q.put({"type": "stop"})
-            return
-        if task.get("type") == "warmup":
-            try:
-                if hasattr(_tts, "_initialize_tts_once"):
-                    _tts._initialize_tts_once()
-                else:
-                    _ = _tts.synthesize_speech_to_memory("あ")
-                output_q.put({"type": "proc_log", "message": "[TTS_PROC] warmup_done"})
-            except Exception as e:
-                output_q.put(
-                    {
-                        "type": "proc_error",
-                        "message": f"[TTS_PROC] warmup_failed: {e}",
-                        "trace": traceback.format_exc(),
-                    }
-                )
-            continue
-
-        idx = task["sentence_idx"]
-        phrase = task["text"]
-        queued_at = float(task.get("queued_at", _time.perf_counter()))
-        sentence_start = _time.perf_counter()
-        queue_wait_ms = (sentence_start - queued_at) * 1000.0
-        output_q.put(
-            {
-                "type": "proc_log",
-                "message": (
-                    f"[TTS_TIMING] worker=proc sentence={idx} stage=tts_start "
-                    f"text_len={len(phrase)} queue_wait_ms={queue_wait_ms:.1f}"
-                ),
-            }
-        )
-
-        total_len = 0
-        tts_chunk_count = 0
-        first_chunk_ready_ms = None
-        try:
-            stream_gen = _tts.synthesize_speech_to_memory_stream(phrase)
-            while True:
-                chunk_start = _time.perf_counter()
-                try:
-                    pcm_chunk = next(stream_gen)
-                except StopIteration:
-                    break
-                chunk_gen_ms = (_time.perf_counter() - chunk_start) * 1000.0
-                if not pcm_chunk:
-                    continue
-                tts_chunk_count += 1
-                if first_chunk_ready_ms is None:
-                    first_chunk_ready_ms = (_time.perf_counter() - sentence_start) * 1000.0
-                total_len += len(pcm_chunk)
-                output_q.put(
-                    {
-                        "type": "chunk",
-                        "sentence_idx": idx,
-                        "tts_chunk_idx": tts_chunk_count,
-                        "worker_id": "proc",
-                        "audio_bytes": pcm_chunk,
-                        "created_at": _time.perf_counter(),
-                        "chunk_gen_ms": chunk_gen_ms,
-                    }
-                )
-        except Exception as e:
-            output_q.put(
-                {
-                    "type": "proc_error",
-                    "message": f"[TTS_TIMING] worker=proc sentence={idx} stream_tts_failed: {e}",
-                    "trace": traceback.format_exc(),
-                }
-            )
-
-        if tts_chunk_count == 0:
-            fallback_start = _time.perf_counter()
-            pcm_all = _tts.synthesize_speech_to_memory(phrase)
-            fallback_ms = (_time.perf_counter() - fallback_start) * 1000.0
-            if pcm_all:
-                tts_chunk_count = 1
-                total_len = len(pcm_all)
-                if first_chunk_ready_ms is None:
-                    first_chunk_ready_ms = (_time.perf_counter() - sentence_start) * 1000.0
-                output_q.put(
-                    {
-                        "type": "chunk",
-                        "sentence_idx": idx,
-                        "tts_chunk_idx": tts_chunk_count,
-                        "worker_id": "proc",
-                        "audio_bytes": pcm_all,
-                        "created_at": _time.perf_counter(),
-                        "chunk_gen_ms": fallback_ms,
-                    }
-                )
-
-        total_tts_ms = (_time.perf_counter() - sentence_start) * 1000.0
-        output_q.put(
-            {
-                "type": "done",
-                "sentence_idx": idx,
-                "tts_chunk_idx": tts_chunk_count,
-                "total_bytes": total_len,
-                "first_chunk_ready_ms": first_chunk_ready_ms,
-                "total_tts_ms": total_tts_ms,
-                "queue_wait_ms": queue_wait_ms,
-            }
-        )
-
-
-def _ensure_tts_process():
-    global _tts_proc_ctx
-    if _tts_proc_ctx is not None and _tts_proc_ctx["proc"].is_alive():
-        return _tts_proc_ctx
-
-    with _tts_proc_lock:
-        if _tts_proc_ctx is not None and _tts_proc_ctx["proc"].is_alive():
-            return _tts_proc_ctx
-
-        stream_emit = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
-        stream_decode = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
-        mp_start_method = os.getenv("PERM_TTS_MP_START_METHOD", "spawn")
-        ctx = mp.get_context(mp_start_method)
-        in_q = ctx.Queue(maxsize=128)
-        out_q = ctx.Queue(maxsize=256)
-        proc = ctx.Process(
-            target=_tts_process_main,
-            args=(in_q, out_q, stream_emit, stream_decode),
-            daemon=True,
-        )
-        proc.start()
-        _tts_proc_ctx = {"proc": proc, "in_q": in_q, "out_q": out_q}
-        logger.info(f"[TTS_PROC] started pid={proc.pid} start_method={mp_start_method}")
-        return _tts_proc_ctx
-
-
-def _shutdown_tts_process():
-    global _tts_proc_ctx
-    if _tts_proc_ctx is None:
-        return
-    proc = _tts_proc_ctx["proc"]
-    in_q = _tts_proc_ctx["in_q"]
-    try:
-        in_q.put_nowait({"type": "stop"})
-    except Exception:
-        pass
-    proc.join(timeout=3.0)
-    if proc.is_alive():
-        logger.warning(f"[TTS_PROC] terminate pid={proc.pid}")
-        proc.terminate()
-    _tts_proc_ctx = None
-
-
 async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: list):
-    async with _tts_request_lock:
-        text_buffer = ""
-        sentence_count = 0
-        full_answer = ""
-        split_pattern = r'(?<=[。！？\n])'
-        llm_tts_start = time.perf_counter()
-        stream_emit = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
-        stream_decode = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
-        stream_cfg = {
-            "emit_every_frames": stream_emit,
-            "decode_window_frames": stream_decode,
-            "overlap_samples": 512,
-            "first_chunk_emit_every": 0,
-            "first_chunk_decode_window": 48,
-            "first_chunk_frames": 48,
-            "repetition_penalty": 1.0,
-            "repetition_penalty_window": 100,
-        }
-        logger.info(
-            "[TTS_CONFIG] "
-            f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
-            f"decode_window_frames={stream_cfg.get('decode_window_frames')} "
-            f"overlap_samples={stream_cfg.get('overlap_samples')} "
-            f"first_chunk_emit_every={stream_cfg.get('first_chunk_emit_every')} "
-            f"first_chunk_decode_window={stream_cfg.get('first_chunk_decode_window')} "
-            f"first_chunk_frames={stream_cfg.get('first_chunk_frames')} "
-            f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
-            f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
-            "tts_workers=proc prefetch_ahead=0"
-        )
-        logger.info(
-            f"[LLM_TTS_FLOW] start text_for_llm_len={len(text_for_llm)} "
-            f"history_len={len(chat_history)} split_pattern={split_pattern}"
-        )
+    text_buffer = ""
+    sentence_count = 0
+    full_answer = ""
+    split_pattern = r'(?<=[。！？\n])'
+    llm_tts_start = time.perf_counter()
+    TTS_WORKER_COUNT = 1
+    TTS_PREFETCH_AHEAD = 1
+    STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
+    STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
+    DETAILED_TIMING = os.getenv("PERM_DETAILED_TIMING", "0") == "1"
+    stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
+    if isinstance(stream_cfg, dict):
+        stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
+        stream_cfg["decode_window_frames"] = STREAM_DECODE_WINDOW_FRAMES
+    logger.info(
+        "[TTS_CONFIG] "
+        f"emit_every_frames={stream_cfg.get('emit_every_frames')} "
+        f"decode_window_frames={stream_cfg.get('decode_window_frames')} "
+        f"overlap_samples={stream_cfg.get('overlap_samples')} "
+        f"first_chunk_emit_every={stream_cfg.get('first_chunk_emit_every')} "
+        f"first_chunk_decode_window={stream_cfg.get('first_chunk_decode_window')} "
+        f"first_chunk_frames={stream_cfg.get('first_chunk_frames')} "
+        f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
+        f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
+        f"tts_workers={TTS_WORKER_COUNT} prefetch_ahead={TTS_PREFETCH_AHEAD}"
+    )
+    logger.info(
+        f"[LLM_TTS_FLOW] start text_for_llm_len={len(text_for_llm)} "
+        f"history_len={len(chat_history)} split_pattern={split_pattern}"
+    )
 
-        tctx = _ensure_tts_process()
-        tts_in_q = tctx["in_q"]
-        tts_out_q = tctx["out_q"]
-        iterator = generate_answer_stream(text_for_llm, history=chat_history)
-        first_audio_sent_at = None
-        sent_arrival_seq = 0
-        websocket_alive = True
+    iterator = generate_answer_stream(text_for_llm, history=chat_history)
 
+    # 16kHz / PCM16 / mono を維持しつつ、20ms単位で細かく送る
+    SAMPLE_RATE = 16000
+    BYTES_PER_SAMPLE = 2
+    FRAME_MS = 20
+    CHUNK_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * FRAME_MS // 1000
+    STOP = object()
+    text_queue = asyncio.Queue()
+    audio_queue = asyncio.Queue()
+    sentence_enqueued_at = {}
+    first_audio_sent_at = None
+    worker_stop_count = 0
+
+    def _next_stream_chunk_or_none(gen):
         try:
-            for chunk in iterator:
-                text_buffer += chunk
-                full_answer += chunk
-                logger.info(
-                    f"[LLM_STREAM] got_chunk len={len(chunk)} "
-                    f"buffer_len={len(text_buffer)} full_len={len(full_answer)}"
-                )
-                if full_answer.strip() == "[SILENCE]":
-                    await _safe_send_json(
-                        {
-                            "status": "system_alert",
-                            "message": "⚠️ 会話外の音声と判断しました。会話を続けてください。",
-                            "alert_type": "irrelevant",
-                        }
+            return next(gen)
+        except StopIteration:
+            return None
+
+    def _noop():
+        return None
+
+    async def tts_worker(worker_id: int):
+        nonlocal worker_stop_count
+        logger.info(f"[TTS_WORKER] worker={worker_id} started")
+        while True:
+            item = await text_queue.get()
+            try:
+                if item is STOP:
+                    worker_stop_count += 1
+                    logger.info(
+                        f"[TTS_WORKER] worker={worker_id} got_stop "
+                        f"worker_stop_count={worker_stop_count}/{TTS_WORKER_COUNT}"
                     )
+                    if worker_stop_count == TTS_WORKER_COUNT:
+                        await audio_queue.put({"type": "stop"})
+                        logger.info("[TTS_WORKER] all workers stopped -> audio_queue stop queued")
                     return
 
-                sentences = re.split(split_pattern, text_buffer)
-                if len(sentences) > 1:
-                    logger.info(
-                        f"[LLM_STREAM] sentence_split count={len(sentences)-1} "
-                        f"tail_len={len(sentences[-1])}"
-                    )
-                    for sent in sentences[:-1]:
-                        if sent.strip():
-                            sentence_count += 1
-                            if websocket_alive:
-                                websocket_alive = await _safe_send_json(
-                                    websocket, {"status": "reply_chunk", "text_chunk": sent}
-                                )
-                            tts_in_q.put(
-                                {
-                                    "type": "synthesize",
-                                    "sentence_idx": sentence_count,
-                                    "text": sent,
-                                    "queued_at": time.perf_counter(),
-                                }
-                            )
-                            logger.info(
-                                f"[LLM_STREAM] enqueued sentence={sentence_count} len={len(sent)} "
-                                "target=tts_process"
-                            )
-                    text_buffer = sentences[-1]
+                idx, phrase = item
+                sentence_start = time.perf_counter()
+                queue_wait_ms = (sentence_start - sentence_enqueued_at.get(idx, sentence_start)) * 1000.0
+                logger.info(
+                    f"[TTS_TIMING] worker={worker_id} sentence={idx} "
+                    f"stage=tts_start text_len={len(phrase)} queue_wait_ms={queue_wait_ms:.1f}"
+                )
+                total_len = 0
+                tts_chunk_count = 0
+                first_chunk_ready_ms = None
+                try:
+                    stream_gen = synthesize_speech_to_memory_stream(phrase)
+                    while True:
+                        # (E) to_thread / スケジューリング固定費の近似
+                        sched_probe_start = time.perf_counter()
+                        await asyncio.to_thread(_noop)
+                        to_thread_overhead_ms = (time.perf_counter() - sched_probe_start) * 1000.0
 
-            if text_buffer.strip():
-                sentence_count += 1
-                if websocket_alive:
-                    websocket_alive = await _safe_send_json(
-                        websocket, {"status": "reply_chunk", "text_chunk": text_buffer}
+                        chunk_wait_start = time.perf_counter()
+                        pcm_chunk = await asyncio.to_thread(_next_stream_chunk_or_none, stream_gen)
+                        chunk_gen_ms = (time.perf_counter() - chunk_wait_start) * 1000.0
+                        approx_model_ms = max(0.0, chunk_gen_ms - to_thread_overhead_ms)
+                        if pcm_chunk is None:
+                            break
+                        tts_chunk_count += 1
+                        if first_chunk_ready_ms is None:
+                            first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
+                        total_len += len(pcm_chunk)
+                        created_at = time.perf_counter()
+                        await audio_queue.put(
+                            {
+                                "type": "chunk",
+                                "sentence_idx": idx,
+                                "tts_chunk_idx": tts_chunk_count,
+                                "worker_id": worker_id,
+                                "audio_bytes": pcm_chunk,
+                                "total_bytes": 0,
+                                "chunk_gen_ms": chunk_gen_ms,
+                                "created_at": created_at,
+                            }
+                        )
+                        logger.info(
+                            f"[TTS_TIMING] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
+                            f"chunk_bytes={len(pcm_chunk)} chunk_gen_ms={chunk_gen_ms:.1f}"
+                        )
+                        if DETAILED_TIMING:
+                            logger.info(
+                                f"[TTS_DETAILED] worker={worker_id} sentence={idx} chunk={tts_chunk_count} "
+                                f"to_thread_overhead_ms={to_thread_overhead_ms:.3f} "
+                                f"approx_model_ms={approx_model_ms:.1f}"
+                            )
+                except Exception as e:
+                    logger.error(
+                        f"[TTS_TIMING] worker={worker_id} sentence={idx} stream_tts_failed: {e}",
+                        exc_info=True,
                     )
-                tts_in_q.put(
+
+                # ストリーミングで1チャンクも取れなかった場合は非ストリーミングへフォールバック
+                if tts_chunk_count == 0:
+                    logger.warning(
+                        f"[TTS_TIMING] worker={worker_id} sentence={idx} no_stream_chunk -> fallback_non_streaming"
+                    )
+                    fallback_start = time.perf_counter()
+                    pcm_all = await asyncio.to_thread(synthesize_speech_to_memory, phrase)
+                    fallback_ms = (time.perf_counter() - fallback_start) * 1000.0
+                    if pcm_all:
+                        tts_chunk_count = 1
+                        total_len = len(pcm_all)
+                        if first_chunk_ready_ms is None:
+                            first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
+                        await audio_queue.put(
+                            {
+                                "type": "chunk",
+                                "sentence_idx": idx,
+                                "tts_chunk_idx": tts_chunk_count,
+                                "worker_id": worker_id,
+                                "audio_bytes": pcm_all,
+                                "total_bytes": 0,
+                                "chunk_gen_ms": fallback_ms,
+                                "created_at": time.perf_counter(),
+                            }
+                        )
+                        logger.info(
+                            f"[TTS_TIMING] worker={worker_id} sentence={idx} fallback_chunk_bytes={len(pcm_all)} "
+                            f"fallback_gen_ms={fallback_ms:.1f}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[TTS_TIMING] worker={worker_id} sentence={idx} fallback returned empty pcm"
+                        )
+
+                total_tts_ms = (time.perf_counter() - sentence_start) * 1000.0
+                await audio_queue.put(
                     {
-                        "type": "synthesize",
-                        "sentence_idx": sentence_count,
-                        "text": text_buffer,
-                        "queued_at": time.perf_counter(),
+                        "type": "done",
+                        "sentence_idx": idx,
+                        "tts_chunk_idx": tts_chunk_count,
+                        "worker_id": worker_id,
+                        "audio_bytes": b"",
+                        "total_bytes": total_len,
+                        "chunk_gen_ms": None,
+                        "created_at": time.perf_counter(),
+                        "first_chunk_ready_ms": first_chunk_ready_ms,
+                        "total_tts_ms": total_tts_ms,
+                        "queue_wait_ms": queue_wait_ms,
                     }
                 )
                 logger.info(
-                    f"[LLM_STREAM] enqueued tail sentence={sentence_count} len={len(text_buffer)} "
-                    "target=tts_process"
+                    f"[TTS_TIMING] worker={worker_id} sentence={idx} stage=tts_done "
+                    f"tts_chunk_count={tts_chunk_count} total_bytes={total_len} total_tts_ms={total_tts_ms:.1f}"
                 )
+            finally:
+                text_queue.task_done()
 
-            done_count = 0
-            while done_count < sentence_count:
-                item = await asyncio.to_thread(tts_out_q.get)
-                typ = item.get("type")
-                if typ == "proc_ready":
-                    logger.info(f"[TTS_PROC] ready pid={item.get('pid')}")
-                    continue
-                if typ == "proc_log":
-                    logger.info(item.get("message", ""))
-                    continue
-                if typ == "proc_error":
-                    logger.error(item.get("message", ""))
-                    logger.error(item.get("trace", ""))
-                    continue
-                if typ == "chunk":
+    async def audio_sender_worker():
+        nonlocal first_audio_sent_at
+        sent_arrival_seq = 0
+        logger.info("[AUDIO_SENDER] started")
+        while True:
+            item = await audio_queue.get()
+            try:
+                if item.get("type") == "stop":
+                    logger.info("[AUDIO_SENDER] got_stop -> exit")
+                    return
+
+                if item["type"] == "chunk":
                     idx = item["sentence_idx"]
                     tts_chunk_idx = item["tts_chunk_idx"]
                     audio_bytes = item["audio_bytes"]
                     send_start = time.perf_counter()
                     queue_to_send_ms = (send_start - item["created_at"]) * 1000.0
                     sent_arrival_seq += 1
-                    if websocket_alive:
-                        websocket_alive = await _safe_send_json(
-                            websocket,
-                            {
-                                "status": "audio_chunk_meta",
-                                "sentence_id": idx,
-                                "chunk_id": tts_chunk_idx,
-                                "arrival_seq": sent_arrival_seq,
-                                "byte_len": len(audio_bytes),
-                                "sample_rate": 16000,
-                            },
-                        )
-                    if websocket_alive:
-                        websocket_alive = await _safe_send_bytes(websocket, audio_bytes)
+                    await websocket.send_json(
+                        {
+                            "status": "audio_chunk_meta",
+                            "sentence_id": idx,
+                            "chunk_id": tts_chunk_idx,
+                            "arrival_seq": sent_arrival_seq,
+                            "byte_len": len(audio_bytes),
+                            "sample_rate": SAMPLE_RATE,
+                        }
+                    )
+                    await websocket.send_bytes(audio_bytes)
                     send_ms = (time.perf_counter() - send_start) * 1000.0
-                    if websocket_alive and first_audio_sent_at is None:
+
+                    if first_audio_sent_at is None:
                         first_audio_sent_at = time.perf_counter()
                         first_audio_ms = (first_audio_sent_at - llm_tts_start) * 1000.0
                         logger.info(f"[TTS_TIMING] first_audio_sent_ms={first_audio_ms:.1f}")
+
                     logger.info(
-                        f"[TTS_TIMING] worker=proc sentence={idx} tts_chunk={tts_chunk_idx} "
-                        f"stage=send chunk_bytes={len(audio_bytes)} ws_chunks=1 "
-                        f"queue_to_send_ms={queue_to_send_ms:.1f} send_ms={send_ms:.1f}"
+                        f"[TTS_TIMING] worker={item['worker_id']} sentence={idx} "
+                        f"tts_chunk={tts_chunk_idx} stage=send chunk_bytes={len(audio_bytes)} "
+                        f"ws_chunks=1 queue_to_send_ms={queue_to_send_ms:.1f} send_ms={send_ms:.1f}"
                     )
-                elif typ == "done":
-                    done_count += 1
-                    if websocket_alive:
-                        websocket_alive = await _safe_send_json(
-                            websocket,
-                            {
-                                "status": "audio_sentence_done",
-                                "sentence_id": item["sentence_idx"],
-                                "last_chunk_id": item.get("tts_chunk_idx", 0),
-                                "total_bytes": item.get("total_bytes", 0),
-                            },
-                        )
+                elif item["type"] == "done":
+                    await websocket.send_json(
+                        {
+                            "status": "audio_sentence_done",
+                            "sentence_id": item["sentence_idx"],
+                            "last_chunk_id": item.get("tts_chunk_idx", 0),
+                            "total_bytes": item.get("total_bytes", 0),
+                        }
+                    )
                     logger.info(
                         f"🚀 Streamed audio {item['sentence_idx']} (Total: {item.get('total_bytes', 0)} bytes) "
                         f"[TTS_TIMING] queue_wait_ms={item.get('queue_wait_ms', 0.0):.1f} "
@@ -597,17 +424,92 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         f"total_tts_ms={item.get('total_tts_ms', 0.0):.1f} "
                         f"tts_chunk_count={item.get('tts_chunk_idx', 0)}"
                     )
+            finally:
+                audio_queue.task_done()
 
-            chat_history.append({"role": "user", "parts": [text_for_llm]})
-            chat_history.append({"role": "model", "parts": [full_answer]})
-            if websocket_alive:
-                await _safe_send_json(websocket, {"status": "complete", "answer_text": full_answer})
+    tts_tasks = [asyncio.create_task(tts_worker(i + 1)) for i in range(TTS_WORKER_COUNT)]
+    sender_task = asyncio.create_task(audio_sender_worker())
+
+    try:
+        for chunk in iterator:
+            text_buffer += chunk
+            full_answer += chunk
             logger.info(
-                f"[LLM_TTS_FLOW] complete answer_len={len(full_answer)} "
-                f"total_llm_tts_ms={(time.perf_counter() - llm_tts_start)*1000.0:.1f}"
+                f"[LLM_STREAM] got_chunk len={len(chunk)} "
+                f"buffer_len={len(text_buffer)} full_len={len(full_answer)}"
             )
-        except Exception as e:
-            logger.error(f"LLM/TTS Error: {e}", exc_info=True)
+            
+            # ★ "irrelevant" タイプとして送信
+            if full_answer.strip() == "[SILENCE]":
+                await websocket.send_json({
+                    "status": "system_alert", 
+                    "message": "⚠️ 会話外の音声と判断しました。会話を続けてください。",
+                    "alert_type": "irrelevant"
+                })
+                return
+
+            sentences = re.split(split_pattern, text_buffer)
+            if len(sentences) > 1:
+                logger.info(
+                    f"[LLM_STREAM] sentence_split count={len(sentences)-1} "
+                    f"tail_len={len(sentences[-1])}"
+                )
+                for sent in sentences[:-1]:
+                    if sent.strip():
+                        sentence_count += 1
+                        await websocket.send_json({"status": "reply_chunk", "text_chunk": sent})
+                        sentence_enqueued_at[sentence_count] = time.perf_counter()
+                        await text_queue.put((sentence_count, sent))
+                        logger.info(
+                            f"[LLM_STREAM] enqueued sentence={sentence_count} len={len(sent)} "
+                            f"text_queue_size={text_queue.qsize()}"
+                        )
+                text_buffer = sentences[-1]
+        
+        if text_buffer.strip():
+            sentence_count += 1
+            await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
+            sentence_enqueued_at[sentence_count] = time.perf_counter()
+            await text_queue.put((sentence_count, text_buffer))
+            logger.info(
+                f"[LLM_STREAM] enqueued tail sentence={sentence_count} len={len(text_buffer)} "
+                f"text_queue_size={text_queue.qsize()}"
+            )
+
+        logger.info("[LLM_STREAM] iterator_done -> sending stop signals to workers")
+        for _ in range(TTS_WORKER_COUNT):
+            await text_queue.put(STOP)
+        logger.info(
+            f"[LLM_STREAM] stop_signals_sent count={TTS_WORKER_COUNT} "
+            f"text_queue_size={text_queue.qsize()}"
+        )
+        await text_queue.join()
+        logger.info("[SYNC] text_queue joined")
+        await audio_queue.join()
+        logger.info("[SYNC] audio_queue joined")
+        for task in tts_tasks:
+            await task
+        logger.info("[SYNC] all tts_workers joined")
+        await sender_task
+        logger.info("[SYNC] audio_sender joined")
+
+        chat_history.append({"role": "user", "parts": [text_for_llm]})
+        chat_history.append({"role": "model", "parts": [full_answer]})
+        
+        await websocket.send_json({"status": "complete", "answer_text": full_answer})
+        logger.info(
+            f"[LLM_TTS_FLOW] complete answer_len={len(full_answer)} "
+            f"total_llm_tts_ms={(time.perf_counter() - llm_tts_start)*1000.0:.1f}"
+        )
+
+    except Exception as e:
+        logger.error(f"LLM/TTS Error: {e}")
+    finally:
+        for task in tts_tasks:
+            if not task.done():
+                task.cancel()
+        if not sender_task.done():
+            sender_task.cancel()
 
 
 # ---------------------------
@@ -615,7 +517,6 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
 # ---------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    _initialize_main_runtime_once()
     await websocket.accept()
     logger.info("[WS] Client Connected.")
     
@@ -639,14 +540,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            try:
-                data_bytes = await websocket.receive_bytes()
-            except WebSocketDisconnect:
-                break
-            except RuntimeError as e:
-                if "WebSocket is not connected" in str(e):
-                    break
-                raise
+            data_bytes = await websocket.receive_bytes()
             audio_chunk_np = np.frombuffer(data_bytes, dtype=np.float32).copy()
             
             offset = 0
@@ -663,8 +557,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         is_speaking = True
                         interruption_triggered = False 
                         audio_buffer = [window_np]
-                        if not await _safe_send_json(websocket, {"status": "processing", "message": "👂 聞いています..."}):
-                            return
+                        await websocket.send_json({"status": "processing", "message": "👂 聞いています..."})
                     
                     elif "end" in speech_dict:
                         logger.info("🤫 Speech END")
@@ -675,11 +568,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             if len(full_audio) / SAMPLE_RATE < 0.2:
                                 logger.info("Noise detected")
-                                if not await _safe_send_json(websocket, {"status": "ignored", "message": "..."}):
-                                    return
+                                await websocket.send_json({"status": "ignored", "message": "..."})
                             else:
-                                if not await _safe_send_json(websocket, {"status": "processing", "message": "🧠 AI思考中..."}):
-                                    return
+                                await websocket.send_json({"status": "processing", "message": "🧠 AI思考中..."})
                                 await process_voice_pipeline(full_audio, websocket, chat_history)
                             audio_buffer = [] 
                 else:
@@ -695,8 +586,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             if is_verified:
                                 logger.info(f"⚡ [Barge-in] {spk_id} の声を検知！停止指示。")
-                                if not await _safe_send_json(websocket, {"status": "interrupt", "message": "🛑 音声停止"}):
-                                    return
+                                await websocket.send_json({"status": "interrupt", "message": "🛑 音声停止"})
                                 interruption_triggered = True
 
     except WebSocketDisconnect:
