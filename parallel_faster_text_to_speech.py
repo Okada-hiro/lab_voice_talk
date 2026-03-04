@@ -36,6 +36,11 @@ QWEN3_DTYPE = os.getenv("QWEN3_DTYPE", "bfloat16")
 QWEN3_XVECTOR_ONLY = os.getenv("QWEN3_XVECTOR_ONLY", "1") == "1"
 QWEN3_STAGE_TIMING = os.getenv("QWEN3_STAGE_TIMING", "0") == "1"
 QWEN3_DIAG = os.getenv("QWEN3_DIAG", "0") == "1"
+QWEN3_DYNAMIC_MAX_NEW_TOKENS = os.getenv("QWEN3_DYNAMIC_MAX_NEW_TOKENS", "1") == "1"
+QWEN3_MIN_NEW_TOKENS = int(os.getenv("QWEN3_MIN_NEW_TOKENS", "96"))
+QWEN3_MAX_NEW_TOKENS_CAP = int(os.getenv("QWEN3_MAX_NEW_TOKENS_CAP", "320"))
+QWEN3_NEW_TOKENS_PER_CHAR = float(os.getenv("QWEN3_NEW_TOKENS_PER_CHAR", "6.0"))
+QWEN3_NEW_TOKENS_BIAS = int(os.getenv("QWEN3_NEW_TOKENS_BIAS", "48"))
 
 DEFAULT_PARAMS = {
     "instruct": "人間らしく、感情豊かに、自然な息遣いで話してください。文末をはっきりと発音すること！",
@@ -87,6 +92,16 @@ def _resample_if_needed(audio: np.ndarray, src_sr: int, tgt_sr: int) -> np.ndarr
     if num_samples <= 0:
         return audio
     return scipy.signal.resample(audio, num_samples).astype(np.float32)
+
+
+def _estimate_max_new_tokens(text: str) -> int:
+    if not QWEN3_DYNAMIC_MAX_NEW_TOKENS:
+        return int(DEFAULT_PARAMS["max_new_tokens"])
+    text_len = max(1, len(text.strip()))
+    est = int(QWEN3_NEW_TOKENS_BIAS + (text_len * QWEN3_NEW_TOKENS_PER_CHAR))
+    est = max(QWEN3_MIN_NEW_TOKENS, est)
+    est = min(QWEN3_MAX_NEW_TOKENS_CAP, est)
+    return est
 
 
 def _pick_model(worker_id: int | None = None):
@@ -183,6 +198,12 @@ def _generate_wav_with_model(tts_model, text_to_speak: str, prompt_text: str = N
         print("[WARN] prompt_text/instruct is ignored in voice-clone mode.")
 
     _ensure_model_warm(tts_model)
+    max_new_tokens = _estimate_max_new_tokens(text_to_speak)
+    if QWEN3_DIAG:
+        print(
+            f"[TTS_DIAG] nonstream_decode text_len={len(text_to_speak)} "
+            f"max_new_tokens={max_new_tokens}"
+        )
 
     wavs, sr = tts_model.generate_voice_clone(
         text=text_to_speak,
@@ -194,7 +215,7 @@ def _generate_wav_with_model(tts_model, text_to_speak: str, prompt_text: str = N
         top_p=DEFAULT_PARAMS["top_p"],
         top_k=DEFAULT_PARAMS["top_k"],
         repetition_penalty=DEFAULT_PARAMS["repetition_penalty"],
-        max_new_tokens=DEFAULT_PARAMS["max_new_tokens"],
+        max_new_tokens=max_new_tokens,
         xvec_only=QWEN3_XVECTOR_ONLY,
     )
     if len(wavs) == 0:
@@ -320,6 +341,12 @@ def synthesize_speech_to_memory_stream_for_worker(text_to_speak: str, worker_id:
         print(f"[TTS_DIAG] stream_start worker={worker_id} text_len={len(text_to_speak)} preview={preview!r} snap={snap}")
 
     _ensure_model_warm(tts_model, model_idx=worker_id)
+    max_new_tokens = _estimate_max_new_tokens(text_to_speak)
+    if QWEN3_DIAG:
+        print(
+            f"[TTS_DIAG] stream_decode worker={worker_id} text_len={len(text_to_speak)} "
+            f"max_new_tokens={max_new_tokens}"
+        )
 
     chunk_size = max(1, int(DEFAULT_STREAM_PARAMS.get("emit_every_frames", 8)))
 
@@ -333,7 +360,7 @@ def synthesize_speech_to_memory_stream_for_worker(text_to_speak: str, worker_id:
         top_p=DEFAULT_PARAMS["top_p"],
         top_k=DEFAULT_PARAMS["top_k"],
         repetition_penalty=DEFAULT_PARAMS["repetition_penalty"],
-        max_new_tokens=DEFAULT_PARAMS["max_new_tokens"],
+        max_new_tokens=max_new_tokens,
         chunk_size=chunk_size,
         xvec_only=QWEN3_XVECTOR_ONLY,
     )

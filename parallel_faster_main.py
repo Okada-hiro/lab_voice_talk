@@ -233,6 +233,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
     STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
     DETAILED_TIMING = os.getenv("PERM_DETAILED_TIMING", "0") == "1"
+    AUDIO_ENERGY_DIAG = os.getenv("PERM_AUDIO_ENERGY_DIAG", "0") == "1"
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
     if isinstance(stream_cfg, dict):
         stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
@@ -317,6 +318,8 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 tts_chunk_count = 0
                 first_chunk_ready_ms = None
                 termination_reason = "stream_stop"
+                tail_low_energy_chunks = 0
+                low_energy_dbfs = -42.0
                 try:
                     stream_gen = synthesize_speech_to_memory_stream_for_worker(phrase, worker_id)
                     while True:
@@ -333,6 +336,16 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                             termination_reason = "stream_eos"
                             break
                         tts_chunk_count += 1
+                        chunk_dbfs = None
+                        if AUDIO_ENERGY_DIAG and pcm_chunk:
+                            arr = np.frombuffer(pcm_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                            if arr.size > 0:
+                                rms = float(np.sqrt(np.mean(arr * arr) + 1e-12))
+                                chunk_dbfs = 20.0 * np.log10(max(rms, 1e-8))
+                                if chunk_dbfs < low_energy_dbfs:
+                                    tail_low_energy_chunks += 1
+                                else:
+                                    tail_low_energy_chunks = 0
                         if first_chunk_ready_ms is None:
                             first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
                         total_len += len(pcm_chunk)
@@ -353,6 +366,11 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                             f"[TTS_TIMING] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
                             f"chunk_bytes={len(pcm_chunk)} chunk_gen_ms={chunk_gen_ms:.1f}"
                         )
+                        if AUDIO_ENERGY_DIAG and chunk_dbfs is not None:
+                            logger.info(
+                                f"[TTS_AUDIO] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
+                                f"chunk_dbfs={chunk_dbfs:.1f} tail_low_energy_chunks={tail_low_energy_chunks}"
+                            )
                         if tts_chunk_count >= TTS_MAX_CHUNKS_PER_SENTENCE:
                             logger.warning(
                                 f"[TTS_TIMING] worker={worker_id} sentence={idx} "
@@ -434,12 +452,18 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     f"tts_chunk_count={tts_chunk_count} total_bytes={total_len} "
                     f"total_tts_ms={total_tts_ms:.1f} termination={termination_reason}"
                 )
+                if AUDIO_ENERGY_DIAG:
+                    logger.info(
+                        f"[TTS_AUDIO] worker={worker_id} sentence={idx} stage=summary "
+                        f"tail_low_energy_chunks={tail_low_energy_chunks} threshold_dbfs={low_energy_dbfs:.1f}"
+                    )
             finally:
                 text_queue.task_done()
 
     async def audio_sender_worker():
         nonlocal first_audio_sent_at
         sent_arrival_seq = 0
+        global_chunk_id = 0
         logger.info("[AUDIO_SENDER] started")
         while True:
             item = await audio_queue.get()
@@ -455,11 +479,13 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     send_start = time.perf_counter()
                     queue_to_send_ms = (send_start - item["created_at"]) * 1000.0
                     sent_arrival_seq += 1
+                    global_chunk_id += 1
                     await websocket.send_json(
                         {
                             "status": "audio_chunk_meta",
                             "sentence_id": idx,
                             "chunk_id": tts_chunk_idx,
+                            "global_chunk_id": global_chunk_id,
                             "arrival_seq": sent_arrival_seq,
                             "byte_len": len(audio_bytes),
                             "sample_rate": SAMPLE_RATE,
@@ -824,14 +850,21 @@ async def get_root():
             let expectedSentenceId = 1;
             let expectedChunkId = 1;
             let isPlaying = false;
+            let processLoopActive = false;
             let jitterPrimed = false;
-            const JITTER_TARGET_MS = 320;   // 初回はこの分だけ貯めてから再生
-            const JITTER_LOW_WATER_MS = 120; // 再生中にここを下回ったら再バッファ
+            const JITTER_TARGET_MS = 320;   // ターン先頭のみ、この分だけ貯めてから再生
             let currentSourceNode = null;
             let currentAiBubble = null;
+            const AUDIO_DIAG = true;
+            let lastScheduledSentenceId = null;
             
             // ★「今後表示しない」設定
             let muteUnregisteredWarning = false;
+
+            function dlog(...args) {
+                if (!AUDIO_DIAG) return;
+                console.log("[AUDIO_DIAG]", ...args);
+            }
 
             // --- Toast通知機能 ---
             function showToast(message) {
@@ -912,10 +945,6 @@ async def get_root():
                 } catch(e) { console.error(e); }
             };
 
-            function makeChunkKey(sentenceId, chunkId) {
-                return `${sentenceId}:${chunkId}`;
-            }
-
             function resetOrderedAudioState() {
                 audioQueue = [];
                 audioMetaQueue = [];
@@ -925,17 +954,35 @@ async def get_root():
                 expectedChunkId = 1;
                 nextStartTime = 0;
                 isPlaying = false;
+                processLoopActive = false;
+                // ターン切替時のみジッタ初期化
                 jitterPrimed = false;
+                lastScheduledSentenceId = null;
+            }
+
+            function makeChunkKey(sentenceId, chunkId) {
+                return `${sentenceId}:${chunkId}`;
             }
 
             function getQueuedAudioMs() {
                 let totalBytes = 0;
-                for (const buf of audioQueue) {
-                    totalBytes += buf.byteLength;
+                for (const pkt of audioQueue) {
+                    if (pkt && pkt.rawBytes) {
+                        totalBytes += pkt.rawBytes.byteLength;
+                    }
                 }
                 // PCM16 mono @16kHz: 2 bytes/sample
                 const totalSamples = totalBytes / 2;
                 return (totalSamples / 16000) * 1000;
+            }
+
+            function getScheduledAheadMs() {
+                if (!audioContext) return 0;
+                return Math.max(0, (nextStartTime - audioContext.currentTime) * 1000);
+            }
+
+            function getBufferedAudioMs() {
+                return getQueuedAudioMs() + getScheduledAheadMs();
             }
 
             function flushOrderedAudio() {
@@ -944,10 +991,15 @@ async def get_root():
                     if (pendingOrderedAudio.has(key)) {
                         audioQueue.push(pendingOrderedAudio.get(key));
                         pendingOrderedAudio.delete(key);
+                        dlog(
+                            "flushOrderedAudio push",
+                            "sentence=", expectedSentenceId,
+                            "chunk=", expectedChunkId,
+                            "audioQueue=", audioQueue.length,
+                            "pending=", pendingOrderedAudio.size
+                        );
                         expectedChunkId += 1;
-                        if (!isPlaying) {
-                            processAudioQueue();
-                        }
+                        processAudioQueue();
                         continue;
                     }
 
@@ -963,7 +1015,15 @@ async def get_root():
 
             function queueOrderedChunk(meta, rawBytes) {
                 const key = makeChunkKey(meta.sentence_id, meta.chunk_id);
-                pendingOrderedAudio.set(key, rawBytes);
+                pendingOrderedAudio.set(key, { meta, rawBytes, enqueuedAt: performance.now() });
+                dlog(
+                    "queueOrderedChunk",
+                    "sentence=", meta.sentence_id,
+                    "chunk=", meta.chunk_id,
+                    "global=", meta.global_chunk_id,
+                    "metaQ=", audioMetaQueue.length,
+                    "pending=", pendingOrderedAudio.size
+                );
                 flushOrderedAudio();
             }
 
@@ -990,7 +1050,8 @@ async def get_root():
                                 queueOrderedChunk(meta, event.data);
                             } else {
                                 // Fallback for legacy binary packets without metadata.
-                                audioQueue.push(event.data);
+                                dlog("binary_without_meta", "bytes=", event.data.byteLength);
+                                audioQueue.push({ meta: null, rawBytes: event.data, enqueuedAt: performance.now() });
                                 processAudioQueue();
                             }
                         } else {
@@ -1004,10 +1065,24 @@ async def get_root():
                             }
                             if (data.status === 'audio_chunk_meta') {
                                 audioMetaQueue.push(data);
+                                dlog(
+                                    "meta_received",
+                                    "sentence=", data.sentence_id,
+                                    "chunk=", data.chunk_id,
+                                    "global=", data.global_chunk_id,
+                                    "metaQ=", audioMetaQueue.length
+                                );
                             }
                             if (data.status === 'audio_sentence_done') {
                                 sentenceDoneMap.set(data.sentence_id, { lastChunkId: data.last_chunk_id });
                                 flushOrderedAudio();
+                                dlog(
+                                    "sentence_done",
+                                    "sentence=", data.sentence_id,
+                                    "last_chunk=", data.last_chunk_id,
+                                    "expected_sentence=", expectedSentenceId,
+                                    "expected_chunk=", expectedChunkId
+                                );
                             }
                             if (data.status === 'system_info') {
                                 logChat('ai', data.message);
@@ -1087,26 +1162,31 @@ async def get_root():
             let nextStartTime = 0;
 
             async function processAudioQueue() {
+                if (processLoopActive) return;
+                processLoopActive = true;
+                try {
+                    while (true) {
                 if (audioQueue.length === 0) {
+                    if (getScheduledAheadMs() > 0) {
+                        return;
+                    }
                     isPlaying = false;
-                    jitterPrimed = false;
+                    // ここでfalseに戻すと文境界ごとに再バッファ待ちが入るため維持する
                     return;
                 }
 
-                const queuedMs = getQueuedAudioMs();
+                const queuedMs = getBufferedAudioMs();
                 if (!jitterPrimed) {
                     if (queuedMs < JITTER_TARGET_MS) {
+                        dlog("jitter_wait", "bufferedMs=", queuedMs.toFixed(1), "target=", JITTER_TARGET_MS);
                         return;
                     }
                     jitterPrimed = true;
-                } else if (queuedMs < JITTER_LOW_WATER_MS) {
-                    // 低水位を下回ったら、少し貯まるまで再生を待つ
-                    jitterPrimed = false;
-                    return;
                 }
 
                 isPlaying = true;
-                const rawBytes = audioQueue.shift();
+                const packet = audioQueue.shift();
+                const rawBytes = packet.rawBytes;
                 
                 try {
                     if (audioContext.state === 'suspended') {
@@ -1140,22 +1220,46 @@ async def get_root():
                     source.connect(audioContext.destination);
 
                     // 現在時刻と、予定時刻を比べて、遅れていれば現在時刻に合わせる
+                    const underrunMs = Math.max(0, (audioContext.currentTime - nextStartTime) * 1000);
                     if (nextStartTime < audioContext.currentTime) {
                         nextStartTime = audioContext.currentTime;
                     }
+                    const sentenceId = packet.meta?.sentence_id ?? null;
+                    const chunkId = packet.meta?.chunk_id ?? null;
+                    const globalChunkId = packet.meta?.global_chunk_id ?? null;
+                    if (lastScheduledSentenceId !== null && sentenceId !== null && sentenceId !== lastScheduledSentenceId) {
+                        dlog(
+                            "sentence_switch",
+                            "from=", lastScheduledSentenceId,
+                            "to=", sentenceId,
+                            "underrunMs=", underrunMs.toFixed(1)
+                        );
+                    }
+                    lastScheduledSentenceId = sentenceId;
+                    dlog(
+                        "schedule_chunk",
+                        "sentence=", sentenceId,
+                        "chunk=", chunkId,
+                        "global=", globalChunkId,
+                        "bytes=", rawBytes.byteLength,
+                        "queuedForMs=", (performance.now() - packet.enqueuedAt).toFixed(1),
+                        "underrunMs=", underrunMs.toFixed(1),
+                        "audioQueue=", audioQueue.length
+                    );
                     
                     source.start(nextStartTime);
                     
                     // 次の音声の開始予定時間を更新（今の音声の長さ分だけ後ろにずらす）
                     nextStartTime += audioBuffer.duration;
 
-                    // 再生が終わるのを待たずに、次のデータの準備にすぐ取り掛かる！
-                    // (これで遅延がさらに減ります)
-                    processAudioQueue();
-                    
                 } catch(e) { 
                     console.error("Raw再生エラー:", e);
                     isPlaying = false;
+                    return;
+                }
+            }
+                } finally {
+                    processLoopActive = false;
                 }
             }
 
