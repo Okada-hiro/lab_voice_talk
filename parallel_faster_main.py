@@ -2,7 +2,7 @@
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import torch
 import numpy as np
@@ -13,6 +13,7 @@ import os
 import io
 import re
 import time
+import wave
 
 # --- ロギング設定 ---
 logging.basicConfig(
@@ -42,6 +43,8 @@ except ImportError as e:
 # --- グローバル設定 ---
 PROCESSING_DIR = "incoming_audio"
 os.makedirs(PROCESSING_DIR, exist_ok=True)
+TTS_DEBUG_WEB_DIR = os.path.join(PROCESSING_DIR, "tts_debug")
+TTS_DEBUG_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "tts_debug_browser.html")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using Device: {DEVICE}")
 SYNC_ROOT_DIR = os.path.abspath(os.getenv("RUNPOD_SYNC_ROOT", "."))
@@ -114,6 +117,40 @@ async def upload_file(
         f.write(data)
     logger.info(f"[SYNC] uploaded: {target_path} ({len(data)} bytes)")
     return {"ok": True, "path": target_path, "bytes": len(data)}
+
+
+@app.get("/api/tts-debug-files")
+async def api_tts_debug_files():
+    os.makedirs(TTS_DEBUG_WEB_DIR, exist_ok=True)
+    rows = []
+    for name in os.listdir(TTS_DEBUG_WEB_DIR):
+        if not name.lower().endswith(".wav"):
+            continue
+        full = os.path.join(TTS_DEBUG_WEB_DIR, name)
+        if not os.path.isfile(full):
+            continue
+        st = os.stat(full)
+        rows.append(
+            {
+                "name": name,
+                "size_bytes": int(st.st_size),
+                "modified_ts": float(st.st_mtime),
+                "url": f"/download/tts_debug/{name}",
+            }
+        )
+    rows.sort(key=lambda x: x["modified_ts"], reverse=True)
+    return JSONResponse({"files": rows, "dir": TTS_DEBUG_WEB_DIR})
+
+
+@app.get("/tts-debug", response_class=HTMLResponse)
+async def tts_debug_page():
+    if not os.path.exists(TTS_DEBUG_VIEWER_HTML):
+        return HTMLResponse(
+            "<h3>tts_debug_browser.html が見つかりません。</h3>",
+            status_code=500,
+        )
+    with open(TTS_DEBUG_VIEWER_HTML, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
 
 # --- ヘルパー: 音声処理パイプライン ---
@@ -234,6 +271,24 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
     DETAILED_TIMING = os.getenv("PERM_DETAILED_TIMING", "0") == "1"
     AUDIO_ENERGY_DIAG = os.getenv("PERM_AUDIO_ENERGY_DIAG", "0") == "1"
+    TAIL_SILENCE_TRIM = os.getenv("PERM_TTS_TRIM_TAIL_SILENCE", "1") == "1"
+    TAIL_SILENCE_DBFS = float(os.getenv("PERM_TTS_TAIL_SILENCE_DBFS", "-42.0"))
+    # Backward compatible:
+    # - old env: PERM_TTS_TAIL_SILENCE_MIN_CHUNKS (kept)
+    # - new env: PERM_TTS_TAIL_SILENCE_MAX_TRIM_CHUNKS
+    TAIL_SILENCE_MAX_TRIM_CHUNKS = int(
+        os.getenv(
+            "PERM_TTS_TAIL_SILENCE_MAX_TRIM_CHUNKS",
+            os.getenv("PERM_TTS_TAIL_SILENCE_MIN_CHUNKS", "40"),
+        )
+    )
+    TAIL_HOLD_CHUNKS = int(os.getenv("PERM_TTS_TAIL_HOLD_CHUNKS", "3"))
+    TAIL_SILENCE_KEEP_CHUNKS = int(os.getenv("PERM_TTS_TAIL_SILENCE_KEEP_CHUNKS", "1"))
+    HEAD_SILENCE_MAX_DROP_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_DROP_CHUNKS", "12"))
+    HEAD_SILENCE_MAX_BUFFER_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_BUFFER_CHUNKS", "4"))
+    SAVE_DEBUG_AUDIO = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO", "0") == "1"
+    SAVE_DEBUG_AUDIO_DIR = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO_DIR", os.path.join(PROCESSING_DIR, "tts_debug"))
+    turn_id = int(time.time() * 1000)
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
     if isinstance(stream_cfg, dict):
         stream_cfg["emit_every_frames"] = STREAM_EMIT_EVERY_FRAMES
@@ -249,7 +304,17 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
         f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
         f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
         f"tts_workers={TTS_WORKER_COUNT} prefetch_ahead={TTS_PREFETCH_AHEAD} "
-        f"max_chunks_per_sentence={TTS_MAX_CHUNKS_PER_SENTENCE}"
+        f"max_chunks_per_sentence={TTS_MAX_CHUNKS_PER_SENTENCE} "
+        f"audio_energy_diag={AUDIO_ENERGY_DIAG} "
+        f"trim_tail_silence={TAIL_SILENCE_TRIM} "
+        f"tail_silence_dbfs={TAIL_SILENCE_DBFS} "
+        f"tail_silence_max_trim_chunks={TAIL_SILENCE_MAX_TRIM_CHUNKS} "
+        f"tail_hold_chunks={TAIL_HOLD_CHUNKS} "
+        f"tail_silence_keep_chunks={TAIL_SILENCE_KEEP_CHUNKS} "
+        f"head_silence_max_drop_chunks={HEAD_SILENCE_MAX_DROP_CHUNKS} "
+        f"head_silence_max_buffer_chunks={HEAD_SILENCE_MAX_BUFFER_CHUNKS} "
+        f"save_debug_audio={SAVE_DEBUG_AUDIO} "
+        f"save_debug_audio_dir={SAVE_DEBUG_AUDIO_DIR}"
     )
     logger.info(
         f"[LLM_TTS_FLOW] start text_for_llm_len={len(text_for_llm)} "
@@ -269,6 +334,14 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     sentence_enqueued_at = {}
     first_audio_sent_at = None
     worker_stop_count = 0
+
+    def _save_debug_wav(path: str, pcm_bytes: bytes):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # PCM16
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(pcm_bytes)
 
     def _next_stream_chunk_or_none(gen):
         try:
@@ -319,7 +392,64 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 first_chunk_ready_ms = None
                 termination_reason = "stream_stop"
                 tail_low_energy_chunks = 0
-                low_energy_dbfs = -42.0
+                low_energy_dbfs = TAIL_SILENCE_DBFS
+                tail_silence_buffer = []
+                head_silence_buffer = []
+                emitted_non_silence = False
+                head_dropped_chunks = 0
+                sentence_pcm = bytearray()
+
+                def _calc_chunk_dbfs(pcm_chunk: bytes):
+                    if not pcm_chunk:
+                        return None
+                    arr = np.frombuffer(pcm_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                    if arr.size == 0:
+                        return None
+                    rms = float(np.sqrt(np.mean(arr * arr) + 1e-12))
+                    return 20.0 * np.log10(max(rms, 1e-8))
+
+                async def _emit_pcm_chunk(pcm_chunk: bytes, chunk_gen_ms_value: float):
+                    nonlocal tts_chunk_count, total_len, first_chunk_ready_ms, tail_low_energy_chunks
+                    if not pcm_chunk:
+                        return None
+                    tts_chunk_count += 1
+                    chunk_dbfs_local = None
+                    arr = np.frombuffer(pcm_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                    if arr.size > 0:
+                        rms = float(np.sqrt(np.mean(arr * arr) + 1e-12))
+                        chunk_dbfs_local = 20.0 * np.log10(max(rms, 1e-8))
+                        if chunk_dbfs_local < low_energy_dbfs:
+                            tail_low_energy_chunks += 1
+                        else:
+                            tail_low_energy_chunks = 0
+                    if first_chunk_ready_ms is None:
+                        first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
+                    total_len += len(pcm_chunk)
+                    sentence_pcm.extend(pcm_chunk)
+                    created_at = time.perf_counter()
+                    await audio_queue.put(
+                        {
+                            "type": "chunk",
+                            "sentence_idx": idx,
+                            "tts_chunk_idx": tts_chunk_count,
+                            "worker_id": worker_id,
+                            "audio_bytes": pcm_chunk,
+                            "total_bytes": 0,
+                            "chunk_gen_ms": chunk_gen_ms_value,
+                            "created_at": created_at,
+                        }
+                    )
+                    logger.info(
+                        f"[TTS_TIMING] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
+                        f"chunk_bytes={len(pcm_chunk)} chunk_gen_ms={chunk_gen_ms_value:.1f}"
+                    )
+                    if AUDIO_ENERGY_DIAG and chunk_dbfs_local is not None:
+                        logger.info(
+                            f"[TTS_AUDIO] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
+                            f"chunk_dbfs={chunk_dbfs_local:.1f} tail_low_energy_chunks={tail_low_energy_chunks}"
+                        )
+                    return chunk_dbfs_local
+
                 try:
                     stream_gen = synthesize_speech_to_memory_stream_for_worker(phrase, worker_id)
                     while True:
@@ -335,42 +465,36 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         if pcm_chunk is None:
                             termination_reason = "stream_eos"
                             break
-                        tts_chunk_count += 1
-                        chunk_dbfs = None
-                        if AUDIO_ENERGY_DIAG and pcm_chunk:
-                            arr = np.frombuffer(pcm_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                            if arr.size > 0:
-                                rms = float(np.sqrt(np.mean(arr * arr) + 1e-12))
-                                chunk_dbfs = 20.0 * np.log10(max(rms, 1e-8))
-                                if chunk_dbfs < low_energy_dbfs:
-                                    tail_low_energy_chunks += 1
-                                else:
-                                    tail_low_energy_chunks = 0
-                        if first_chunk_ready_ms is None:
-                            first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
-                        total_len += len(pcm_chunk)
-                        created_at = time.perf_counter()
-                        await audio_queue.put(
-                            {
-                                "type": "chunk",
-                                "sentence_idx": idx,
-                                "tts_chunk_idx": tts_chunk_count,
-                                "worker_id": worker_id,
-                                "audio_bytes": pcm_chunk,
-                                "total_bytes": 0,
-                                "chunk_gen_ms": chunk_gen_ms,
-                                "created_at": created_at,
-                            }
-                        )
-                        logger.info(
-                            f"[TTS_TIMING] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
-                            f"chunk_bytes={len(pcm_chunk)} chunk_gen_ms={chunk_gen_ms:.1f}"
-                        )
-                        if AUDIO_ENERGY_DIAG and chunk_dbfs is not None:
-                            logger.info(
-                                f"[TTS_AUDIO] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
-                                f"chunk_dbfs={chunk_dbfs:.1f} tail_low_energy_chunks={tail_low_energy_chunks}"
-                            )
+                        if TAIL_SILENCE_TRIM:
+                            chunk_dbfs_now = _calc_chunk_dbfs(pcm_chunk)
+                            if chunk_dbfs_now is not None and chunk_dbfs_now < low_energy_dbfs:
+                                if not emitted_non_silence:
+                                    # 先頭の低エネルギー区間: まずは削除、削除上限を超えたら最小限だけ送る。
+                                    if head_dropped_chunks < HEAD_SILENCE_MAX_DROP_CHUNKS:
+                                        head_dropped_chunks += 1
+                                        continue
+                                    head_silence_buffer.append((pcm_chunk, chunk_gen_ms))
+                                    if len(head_silence_buffer) > max(1, HEAD_SILENCE_MAX_BUFFER_CHUNKS):
+                                        emit_pcm, emit_ms = head_silence_buffer.pop(0)
+                                        await _emit_pcm_chunk(emit_pcm, emit_ms)
+                                    continue
+                                # 非無音出現後の低エネルギー区間は末尾候補として保持
+                                tail_silence_buffer.append((pcm_chunk, chunk_gen_ms))
+                                continue
+                            if not emitted_non_silence:
+                                emitted_non_silence = True
+                                if head_silence_buffer:
+                                    for emit_pcm, emit_ms in head_silence_buffer:
+                                        await _emit_pcm_chunk(emit_pcm, emit_ms)
+                                    head_silence_buffer.clear()
+                            # 非無音が来たので、保持していた末尾候補は実際には「末尾」でない。
+                            if tail_silence_buffer:
+                                for emit_pcm, emit_ms in tail_silence_buffer:
+                                    await _emit_pcm_chunk(emit_pcm, emit_ms)
+                                tail_silence_buffer.clear()
+                            await _emit_pcm_chunk(pcm_chunk, chunk_gen_ms)
+                        else:
+                            await _emit_pcm_chunk(pcm_chunk, chunk_gen_ms)
                         if tts_chunk_count >= TTS_MAX_CHUNKS_PER_SENTENCE:
                             logger.warning(
                                 f"[TTS_TIMING] worker={worker_id} sentence={idx} "
@@ -384,6 +508,31 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                                 f"to_thread_overhead_ms={to_thread_overhead_ms:.3f} "
                                 f"approx_model_ms={approx_model_ms:.1f}"
                             )
+                    if TAIL_SILENCE_TRIM and tail_silence_buffer:
+                        # EOS時点で保持中なのは「文末連続低エネルギー区間」。
+                        # 上限まで削り、少しだけ残したい場合は KEEP_CHUNKS で制御。
+                        drop_cap = max(0, TAIL_SILENCE_MAX_TRIM_CHUNKS)
+                        keep_chunks = max(0, TAIL_SILENCE_KEEP_CHUNKS)
+                        drop_count = min(max(0, len(tail_silence_buffer) - keep_chunks), drop_cap)
+                        if drop_count > 0:
+                            logger.info(
+                                f"[TTS_AUDIO] worker={worker_id} sentence={idx} "
+                                f"tail_trimmed_chunks={drop_count} threshold_dbfs={low_energy_dbfs:.1f} "
+                                f"buffered_tail_chunks={len(tail_silence_buffer)} keep_chunks={keep_chunks}"
+                            )
+                        for emit_pcm, emit_ms in tail_silence_buffer[: len(tail_silence_buffer) - drop_count]:
+                            await _emit_pcm_chunk(emit_pcm, emit_ms)
+                        tail_silence_buffer.clear()
+                    if TAIL_SILENCE_TRIM and (head_dropped_chunks > 0 or head_silence_buffer):
+                        logger.info(
+                            f"[TTS_AUDIO] worker={worker_id} sentence={idx} "
+                            f"head_dropped_chunks={head_dropped_chunks} "
+                            f"head_buffered_chunks={len(head_silence_buffer)} threshold_dbfs={low_energy_dbfs:.1f}"
+                        )
+                    if head_silence_buffer:
+                        for emit_pcm, emit_ms in head_silence_buffer:
+                            await _emit_pcm_chunk(emit_pcm, emit_ms)
+                        head_silence_buffer.clear()
                 except Exception as e:
                     termination_reason = f"stream_exception:{type(e).__name__}"
                     logger.error(
@@ -407,6 +556,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     if pcm_all:
                         tts_chunk_count = 1
                         total_len = len(pcm_all)
+                        sentence_pcm = bytearray(pcm_all)
                         if first_chunk_ready_ms is None:
                             first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
                         await audio_queue.put(
@@ -452,6 +602,22 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     f"tts_chunk_count={tts_chunk_count} total_bytes={total_len} "
                     f"total_tts_ms={total_tts_ms:.1f} termination={termination_reason}"
                 )
+                if SAVE_DEBUG_AUDIO and total_len > 0:
+                    debug_wav_path = os.path.join(
+                        SAVE_DEBUG_AUDIO_DIR,
+                        f"turn_{turn_id}_sentence_{idx:02d}_worker_{worker_id}_bytes_{total_len}.wav",
+                    )
+                    try:
+                        await asyncio.to_thread(_save_debug_wav, debug_wav_path, bytes(sentence_pcm))
+                        logger.info(
+                            f"[TTS_DEBUG_AUDIO] worker={worker_id} sentence={idx} "
+                            f"saved_wav={debug_wav_path} bytes={total_len}"
+                        )
+                    except Exception as save_e:
+                        logger.error(
+                            f"[TTS_DEBUG_AUDIO] worker={worker_id} sentence={idx} save_failed: {save_e}",
+                            exc_info=True,
+                        )
                 if AUDIO_ENERGY_DIAG:
                     logger.info(
                         f"[TTS_AUDIO] worker={worker_id} sentence={idx} stage=summary "
