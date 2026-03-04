@@ -209,6 +209,11 @@ try:
         attn_implementation="eager",  # faster-qwen3-tts is designed without flash-attn dependency
     )
 
+    # CUDA graph capture cannot include multinomial sampling.
+    # Force deterministic predictor path even if upstream defaults to do_sample=True.
+    if hasattr(GLOBAL_TTS_MODEL, "predictor_graph") and GLOBAL_TTS_MODEL.predictor_graph is not None:
+        GLOBAL_TTS_MODEL.predictor_graph.do_sample = False
+
     if not QWEN3_REF_AUDIO:
         raise ValueError("QWEN3_REF_AUDIO is empty. Set reference audio path for voice cloning.")
 
