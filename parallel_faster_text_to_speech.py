@@ -1,6 +1,7 @@
 import io
 import os
 import sys
+import threading
 import time
 import traceback
 
@@ -22,6 +23,10 @@ GLOBAL_TTS_MODEL = None
 GLOBAL_TTS_MODELS = []
 GLOBAL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PARALLEL_TTS_MODEL_COUNT = int(os.getenv("PARALLEL_TTS_MODEL_COUNT", "2" if "cuda" in GLOBAL_DEVICE else "1"))
+GLOBAL_WARMUP_LOCK = threading.Lock()
+GLOBAL_MODEL_STATE_LOCK = threading.Lock()
+GLOBAL_MODEL_WARMUP_LOCKS = {}
+GLOBAL_MODEL_WARMED = {}
 
 QWEN3_MODEL_PATH = os.getenv("QWEN3_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 QWEN3_REF_AUDIO = os.getenv("QWEN3_REF_AUDIO", "")
@@ -92,6 +97,59 @@ def _pick_model(worker_id: int | None = None):
     return GLOBAL_TTS_MODELS[idx]
 
 
+def _get_model_warmup_lock(tts_model):
+    mid = id(tts_model)
+    with GLOBAL_MODEL_STATE_LOCK:
+        if mid not in GLOBAL_MODEL_WARMUP_LOCKS:
+            GLOBAL_MODEL_WARMUP_LOCKS[mid] = threading.Lock()
+        return GLOBAL_MODEL_WARMUP_LOCKS[mid]
+
+
+def _is_model_warmed(tts_model) -> bool:
+    if tts_model is None:
+        return False
+    if bool(getattr(tts_model, "_warmed_up", False)):
+        return True
+    with GLOBAL_MODEL_STATE_LOCK:
+        return bool(GLOBAL_MODEL_WARMED.get(id(tts_model), False))
+
+
+def _mark_model_warmed(tts_model):
+    if tts_model is None:
+        return
+    with GLOBAL_MODEL_STATE_LOCK:
+        GLOBAL_MODEL_WARMED[id(tts_model)] = True
+
+
+def _ensure_model_warm(tts_model, model_idx: int | None = None):
+    if tts_model is None:
+        raise RuntimeError("Faster Qwen3-TTS model is not initialized.")
+    if _is_model_warmed(tts_model):
+        return
+
+    model_lock = _get_model_warmup_lock(tts_model)
+    with model_lock:
+        if _is_model_warmed(tts_model):
+            return
+        # CUDA graph capture is not safe to run concurrently.
+        with GLOBAL_WARMUP_LOCK:
+            if _is_model_warmed(tts_model):
+                return
+            tag = f"model={model_idx}" if model_idx is not None else "model=unknown"
+            print(f"[INFO] Faster Qwen3-TTS: warm-up start ({tag})")
+            _ = tts_model.generate_voice_clone(
+                text="あ",
+                language=QWEN3_LANGUAGE,
+                ref_audio=QWEN3_REF_AUDIO,
+                ref_text=QWEN3_REF_TEXT,
+                do_sample=False,
+                max_new_tokens=96,
+                xvec_only=QWEN3_XVECTOR_ONLY,
+            )
+            _mark_model_warmed(tts_model)
+            print(f"[INFO] Faster Qwen3-TTS: warm-up done ({tag})")
+
+
 def _generate_wav_with_model(tts_model, text_to_speak: str, prompt_text: str = None):
     if tts_model is None:
         raise RuntimeError("Faster Qwen3-TTS model is not initialized.")
@@ -100,6 +158,8 @@ def _generate_wav_with_model(tts_model, text_to_speak: str, prompt_text: str = N
 
     if prompt_text:
         print("[WARN] prompt_text/instruct is ignored in voice-clone mode.")
+
+    _ensure_model_warm(tts_model)
 
     wavs, sr = tts_model.generate_voice_clone(
         text=text_to_speak,
@@ -165,6 +225,8 @@ def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = No
     if prompt_text:
         print("[WARN] prompt_text/instruct is ignored in streaming mode.")
 
+    _ensure_model_warm(tts_model)
+
     chunk_size = max(1, int(DEFAULT_STREAM_PARAMS.get("emit_every_frames", 8)))
 
     chunk_iter = tts_model.generate_voice_clone_streaming(
@@ -224,6 +286,8 @@ def synthesize_speech_to_memory_stream_for_worker(text_to_speak: str, worker_id:
 
     if prompt_text:
         print("[WARN] prompt_text/instruct is ignored in streaming mode.")
+
+    _ensure_model_warm(tts_model, model_idx=worker_id)
 
     chunk_size = max(1, int(DEFAULT_STREAM_PARAMS.get("emit_every_frames", 8)))
 
@@ -289,16 +353,9 @@ try:
     if (not QWEN3_XVECTOR_ONLY) and (not QWEN3_REF_TEXT):
         raise ValueError("QWEN3_REF_TEXT is empty. Set transcript or enable QWEN3_XVECTOR_ONLY=1.")
 
-    print("[INFO] Faster Qwen3-TTS: warm-up inference...")
-    _ = GLOBAL_TTS_MODEL.generate_voice_clone(
-        text="あ",
-        language=QWEN3_LANGUAGE,
-        ref_audio=QWEN3_REF_AUDIO,
-        ref_text=QWEN3_REF_TEXT,
-        do_sample=False,
-        max_new_tokens=96,
-        xvec_only=QWEN3_XVECTOR_ONLY,
-    )
+    print("[INFO] Faster Qwen3-TTS: sequential warm-up for all model instances...")
+    for i, tts_model in enumerate(GLOBAL_TTS_MODELS, start=1):
+        _ensure_model_warm(tts_model, model_idx=i)
     print("[INFO] Faster Qwen3-TTS initialization complete.")
 except Exception as e:
     print(f"[ERROR] Faster Qwen3-TTS init failed: {e}")
