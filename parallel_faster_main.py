@@ -229,6 +229,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     llm_tts_start = time.perf_counter()
     TTS_WORKER_COUNT = 2
     TTS_PREFETCH_AHEAD = 1
+    TTS_MAX_CHUNKS_PER_SENTENCE = int(os.getenv("PERM_TTS_MAX_CHUNKS_PER_SENTENCE", "40"))
     STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
     STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
     DETAILED_TIMING = os.getenv("PERM_DETAILED_TIMING", "0") == "1"
@@ -246,7 +247,8 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
         f"first_chunk_frames={stream_cfg.get('first_chunk_frames')} "
         f"repetition_penalty={stream_cfg.get('repetition_penalty')} "
         f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
-        f"tts_workers={TTS_WORKER_COUNT} prefetch_ahead={TTS_PREFETCH_AHEAD}"
+        f"tts_workers={TTS_WORKER_COUNT} prefetch_ahead={TTS_PREFETCH_AHEAD} "
+        f"max_chunks_per_sentence={TTS_MAX_CHUNKS_PER_SENTENCE}"
     )
     logger.info(
         f"[LLM_TTS_FLOW] start text_for_llm_len={len(text_for_llm)} "
@@ -300,9 +302,21 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     f"[TTS_TIMING] worker={worker_id} sentence={idx} "
                     f"stage=tts_start text_len={len(phrase)} queue_wait_ms={queue_wait_ms:.1f}"
                 )
+                phrase_preview = phrase[:80].replace("\n", "\\n")
+                tts_snapshot = None
+                if hasattr(tts_module, "get_tts_debug_snapshot"):
+                    try:
+                        tts_snapshot = tts_module.get_tts_debug_snapshot(worker_id)
+                    except Exception:
+                        tts_snapshot = {"snapshot_error": True}
+                logger.info(
+                    f"[TTS_DIAG] worker={worker_id} sentence={idx} "
+                    f"phrase={phrase_preview!r} phrase_repr={phrase!r} model={tts_snapshot}"
+                )
                 total_len = 0
                 tts_chunk_count = 0
                 first_chunk_ready_ms = None
+                termination_reason = "stream_stop"
                 try:
                     stream_gen = synthesize_speech_to_memory_stream_for_worker(phrase, worker_id)
                     while True:
@@ -316,6 +330,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         chunk_gen_ms = (time.perf_counter() - chunk_wait_start) * 1000.0
                         approx_model_ms = max(0.0, chunk_gen_ms - to_thread_overhead_ms)
                         if pcm_chunk is None:
+                            termination_reason = "stream_eos"
                             break
                         tts_chunk_count += 1
                         if first_chunk_ready_ms is None:
@@ -338,6 +353,13 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                             f"[TTS_TIMING] worker={worker_id} sentence={idx} tts_chunk={tts_chunk_count} "
                             f"chunk_bytes={len(pcm_chunk)} chunk_gen_ms={chunk_gen_ms:.1f}"
                         )
+                        if tts_chunk_count >= TTS_MAX_CHUNKS_PER_SENTENCE:
+                            logger.warning(
+                                f"[TTS_TIMING] worker={worker_id} sentence={idx} "
+                                f"hit_chunk_cap={TTS_MAX_CHUNKS_PER_SENTENCE} -> truncating sentence"
+                            )
+                            termination_reason = "chunk_cap"
+                            break
                         if DETAILED_TIMING:
                             logger.info(
                                 f"[TTS_DETAILED] worker={worker_id} sentence={idx} chunk={tts_chunk_count} "
@@ -345,6 +367,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                                 f"approx_model_ms={approx_model_ms:.1f}"
                             )
                 except Exception as e:
+                    termination_reason = f"stream_exception:{type(e).__name__}"
                     logger.error(
                         f"[TTS_TIMING] worker={worker_id} sentence={idx} stream_tts_failed: {e}",
                         exc_info=True,
@@ -355,6 +378,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                     logger.warning(
                         f"[TTS_TIMING] worker={worker_id} sentence={idx} no_stream_chunk -> fallback_non_streaming"
                     )
+                    termination_reason = "fallback_non_streaming"
                     fallback_start = time.perf_counter()
                     pcm_all = await asyncio.to_thread(
                         synthesize_speech_to_memory_for_worker,
@@ -384,6 +408,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                             f"fallback_gen_ms={fallback_ms:.1f}"
                         )
                     else:
+                        termination_reason = "fallback_empty"
                         logger.warning(
                             f"[TTS_TIMING] worker={worker_id} sentence={idx} fallback returned empty pcm"
                         )
@@ -406,7 +431,8 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 )
                 logger.info(
                     f"[TTS_TIMING] worker={worker_id} sentence={idx} stage=tts_done "
-                    f"tts_chunk_count={tts_chunk_count} total_bytes={total_len} total_tts_ms={total_tts_ms:.1f}"
+                    f"tts_chunk_count={tts_chunk_count} total_bytes={total_len} "
+                    f"total_tts_ms={total_tts_ms:.1f} termination={termination_reason}"
                 )
             finally:
                 text_queue.task_done()

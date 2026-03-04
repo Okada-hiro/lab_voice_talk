@@ -35,6 +35,7 @@ QWEN3_LANGUAGE = os.getenv("QWEN3_LANGUAGE", "Japanese")
 QWEN3_DTYPE = os.getenv("QWEN3_DTYPE", "bfloat16")
 QWEN3_XVECTOR_ONLY = os.getenv("QWEN3_XVECTOR_ONLY", "1") == "1"
 QWEN3_STAGE_TIMING = os.getenv("QWEN3_STAGE_TIMING", "0") == "1"
+QWEN3_DIAG = os.getenv("QWEN3_DIAG", "0") == "1"
 
 DEFAULT_PARAMS = {
     "instruct": "人間らしく、感情豊かに、自然な息遣いで話してください。文末をはっきりと発音すること！",
@@ -95,6 +96,28 @@ def _pick_model(worker_id: int | None = None):
         return GLOBAL_TTS_MODELS[0]
     idx = (int(worker_id) - 1) % len(GLOBAL_TTS_MODELS)
     return GLOBAL_TTS_MODELS[idx]
+
+
+def get_tts_debug_snapshot(worker_id: int | None = None) -> dict:
+    tts_model = _pick_model(worker_id)
+    if tts_model is None:
+        return {
+            "worker_id": worker_id,
+            "model_exists": False,
+        }
+    predictor = getattr(tts_model, "predictor_graph", None)
+    talker = getattr(tts_model, "talker_graph", None)
+    return {
+        "worker_id": worker_id,
+        "model_exists": True,
+        "model_id": id(tts_model),
+        "model_warmed": _is_model_warmed(tts_model),
+        "predictor_graph_id": id(predictor) if predictor is not None else None,
+        "talker_graph_id": id(talker) if talker is not None else None,
+        "predictor_do_sample": getattr(predictor, "do_sample", None) if predictor is not None else None,
+        "max_new_tokens": DEFAULT_PARAMS["max_new_tokens"],
+        "emit_every_frames": DEFAULT_STREAM_PARAMS.get("emit_every_frames"),
+    }
 
 
 def _get_model_warmup_lock(tts_model):
@@ -268,7 +291,11 @@ def synthesize_speech_to_memory_stream(text_to_speak: str, prompt_text: str = No
 
 def synthesize_speech_to_memory_for_worker(text_to_speak: str, worker_id: int) -> bytes:
     try:
-        wav, sr = _generate_wav_with_model(_pick_model(worker_id), text_to_speak, prompt_text=None)
+        tts_model = _pick_model(worker_id)
+        if QWEN3_DIAG:
+            snap = get_tts_debug_snapshot(worker_id)
+            print(f"[TTS_DIAG] nonstream_start worker={worker_id} text_len={len(text_to_speak)} snap={snap}")
+        wav, sr = _generate_wav_with_model(tts_model, text_to_speak, prompt_text=None)
         wav = _resample_if_needed(wav, sr, DEFAULT_PARAMS["target_sr"])
         return _to_pcm16_bytes(wav)
     except Exception as e:
@@ -286,6 +313,11 @@ def synthesize_speech_to_memory_stream_for_worker(text_to_speak: str, worker_id:
 
     if prompt_text:
         print("[WARN] prompt_text/instruct is ignored in streaming mode.")
+
+    if QWEN3_DIAG:
+        snap = get_tts_debug_snapshot(worker_id)
+        preview = text_to_speak[:64].replace("\n", "\\n")
+        print(f"[TTS_DIAG] stream_start worker={worker_id} text_len={len(text_to_speak)} preview={preview!r} snap={snap}")
 
     _ensure_model_warm(tts_model, model_idx=worker_id)
 
