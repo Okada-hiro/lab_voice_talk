@@ -24,38 +24,19 @@ pip install -U librosa scipy soundfile pyworld pyopenjtalk num2words pydub
 # -------------------------------------
 # 4. Web / AI系
 # -------------------------------------
-pip install -U fastapi uvicorn[standard] google-generativeai openai huggingface_hub loguru transformers speechbrain
+pip install -U fastapi uvicorn[standard] google-generativeai huggingface_hub loguru transformers speechbrain
 
-# -------------------------------------
-# 5. Qwen3-TTS (base: setup_environment_qwen3tts.sh と同等)
-# -------------------------------------
-pip install -U qwen-tts
 
-WORKDIR="${WORKDIR:-/workspace}"
-mkdir -p "${WORKDIR}"
-if [ ! -d "${WORKDIR}/Qwen3-TTS" ]; then
-  git clone https://github.com/QwenLM/Qwen3-TTS.git "${WORKDIR}/Qwen3-TTS"
-fi
 
-# -------------------------------------
-# 6. Qwen3-TTS streaming fork を追加導入（上位互換ポイント）
-# -------------------------------------
-QWEN3_TTS_STREAMING_REPO="${QWEN3_TTS_STREAMING_REPO:-https://github.com/dffdeeq/Qwen3-TTS-streaming.git}"
-if [ ! -d "${WORKDIR}/Qwen3-TTS-streaming" ]; then
-  git clone "${QWEN3_TTS_STREAMING_REPO}" "${WORKDIR}/Qwen3-TTS-streaming"
-fi
+# 0) そもそもworkspace/lab_voice_talkだが、workspace/faster-qwen3ttsにする
 
-# streaming fork を有効化
-pip uninstall -y qwen-tts qwen_tts || true
-pip install -e "${WORKDIR}/Qwen3-TTS-streaming"
+# 1) 競合しやすいものを入れ直し
+pip uninstall -y qwen-tts faster-qwen3-tts transformers huggingface_hub speechbrain
 
-# 動作確認（stream API の有無）
-python - <<'PY'
-try:
-    from qwen_tts import Qwen3TTSModel
-    m = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-0.6B-Base", device_map="cuda")
-    print("[CHECK] has_stream_generate_voice_clone:", hasattr(m, "stream_generate_voice_clone"))
-except Exception as e:
-    print("[CHECK] streaming check skipped/failed:", e)
-PY
+# 2) 互換が取りやすい組み合わせで再インストール
+pip install "transformers==4.57.3" "qwen-tts==0.1.1"
+pip install "huggingface_hub<1.0" "speechbrain>=1.0.0"
+
+# 3) faster-qwen3-tts はローカルを優先（推奨）
+pip install -e /workspace/faster-qwen3-tts
 
