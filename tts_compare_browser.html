@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TTS Compare Audio Browser</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 24px;
+      color: #111;
+      background: #f7f7f8;
+    }
+    h1 {
+      margin: 0 0 12px 0;
+      font-size: 22px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 8px 12px;
+      border: 1px solid #c9c9cf;
+      background: #fff;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border: 1px solid #ddd;
+      margin-top: 14px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px;
+      border-bottom: 1px solid #eee;
+      vertical-align: middle;
+      font-size: 13px;
+    }
+    th { background: #fafafa; }
+    audio { width: 320px; max-width: 100%; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .hint {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #666;
+    }
+    .latest {
+      border: 1px solid #ddd;
+      background: #fff;
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .latest h2 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+    }
+    .latest-grid {
+      display: grid;
+      gap: 6px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <h1>TTS Compare Audio Browser</h1>
+  <div class="toolbar">
+    <button id="refreshBtn">Refresh</button>
+    <a href="/tts-debug" target="_blank" rel="noopener">Open TTS Debug</a>
+    <span id="countLabel"></span>
+  </div>
+
+  <div class="latest">
+    <h2>Latest Stream-Copy WAV</h2>
+    <div id="latestBox" class="latest-grid">loading...</div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>File</th>
+        <th>Updated</th>
+        <th>Size</th>
+        <th>Player</th>
+        <th>Link</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div class="hint">
+    ここに表示される WAV は、WebSocket でクライアントへ送ったPCMを結合して保存した比較用音声です。
+  </div>
+
+  <script>
+    const rowsEl = document.getElementById("rows");
+    const countLabel = document.getElementById("countLabel");
+    const latestBox = document.getElementById("latestBox");
+    const refreshBtn = document.getElementById("refreshBtn");
+
+    function fmtBytes(n) {
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    function fmtTime(ts) {
+      const d = new Date(ts * 1000);
+      return d.toLocaleString();
+    }
+
+    async function loadLatest() {
+      try {
+        const resp = await fetch("/api/tts-compare-latest");
+        const data = await resp.json();
+        if (!resp.ok || !data.ok || !data.latest) {
+          latestBox.innerHTML = `No latest file yet.`;
+          return;
+        }
+        const x = data.latest;
+        latestBox.innerHTML = `
+          <div><b>file:</b> <span class="mono">${x.name}</span></div>
+          <div><b>updated:</b> ${fmtTime(x.modified_ts)}</div>
+          <div><b>size:</b> ${fmtBytes(x.size_bytes)} / <b>sample_rate:</b> ${x.sample_rate}</div>
+          <div><audio controls preload="none" src="${x.url}"></audio></div>
+          <div><a href="${x.url}" target="_blank" rel="noopener">open latest</a></div>
+        `;
+      } catch (e) {
+        latestBox.innerHTML = `failed to load latest: ${String(e)}`;
+      }
+    }
+
+    async function loadList() {
+      rowsEl.innerHTML = "";
+      try {
+        const resp = await fetch("/api/tts-compare-files");
+        const data = await resp.json();
+        const files = data.files || [];
+        countLabel.textContent = `${files.length} files`;
+
+        for (const f of files) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="mono">${f.name}</td>
+            <td>${fmtTime(f.modified_ts)}</td>
+            <td>${fmtBytes(f.size_bytes)}</td>
+            <td><audio controls preload="none" src="${f.url}"></audio></td>
+            <td><a href="${f.url}" target="_blank" rel="noopener">open</a></td>
+          `;
+          rowsEl.appendChild(tr);
+        }
+      } catch (e) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td colspan="5">failed to load list: ${String(e)}</td>`;
+        rowsEl.appendChild(tr);
+      }
+    }
+
+    async function refreshAll() {
+      await Promise.all([loadLatest(), loadList()]);
+    }
+
+    refreshBtn.onclick = refreshAll;
+    refreshAll();
+  </script>
+</body>
+</html>

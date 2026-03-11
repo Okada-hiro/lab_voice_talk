@@ -46,6 +46,9 @@ PROCESSING_DIR = "incoming_audio"
 os.makedirs(PROCESSING_DIR, exist_ok=True)
 TTS_DEBUG_WEB_DIR = os.path.join(PROCESSING_DIR, "tts_debug")
 TTS_DEBUG_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "tts_debug_browser.html")
+TTS_COMPARE_WEB_DIR = os.path.join(PROCESSING_DIR, "tts_compare")
+TTS_COMPARE_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "tts_compare_browser.html")
+os.makedirs(TTS_COMPARE_WEB_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using Device: {DEVICE}")
 SYNC_ROOT_DIR = os.path.abspath(os.getenv("RUNPOD_SYNC_ROOT", "."))
@@ -55,6 +58,7 @@ logger.info(f"[SYNC] root={SYNC_ROOT_DIR}")
 
 app = FastAPI()
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
+LATEST_TTS_COMPARE_INFO: Dict[str, object] = {}
 
 SAMPLE_SCRIPT_PATH = os.getenv("SAMPLE_SCRIPT_PATH", os.path.join(os.path.dirname(__file__), "原稿.rtf"))
 SAMPLE_SCRIPT_SOURCE = os.getenv("SAMPLE_SCRIPT_SOURCE", "inline").strip().lower()
@@ -278,6 +282,27 @@ def _resolve_sync_path(relative_path: str) -> str:
     return full
 
 
+def _build_download_url(abs_path: str) -> str:
+    rel = os.path.relpath(abs_path, PROCESSING_DIR).replace(os.sep, "/")
+    return f"/download/{rel}"
+
+
+def _register_latest_compare_file(abs_path: str, turn_id: int, answer_text: str, sentence_count: int, sample_rate: int):
+    global LATEST_TTS_COMPARE_INFO
+    st = os.stat(abs_path)
+    LATEST_TTS_COMPARE_INFO = {
+        "turn_id": turn_id,
+        "path": abs_path,
+        "name": os.path.basename(abs_path),
+        "size_bytes": int(st.st_size),
+        "modified_ts": float(st.st_mtime),
+        "url": _build_download_url(abs_path),
+        "sample_rate": sample_rate,
+        "sentence_count": sentence_count,
+        "answer_text": answer_text,
+    }
+
+
 @app.post("/admin/upload-file")
 async def upload_file(
     relative_path: str = Form(...),
@@ -317,6 +342,39 @@ async def api_tts_debug_files():
     return JSONResponse({"files": rows, "dir": TTS_DEBUG_WEB_DIR})
 
 
+@app.get("/api/tts-compare-files")
+async def api_tts_compare_files():
+    os.makedirs(TTS_COMPARE_WEB_DIR, exist_ok=True)
+    rows = []
+    for name in os.listdir(TTS_COMPARE_WEB_DIR):
+        if not name.lower().endswith(".wav"):
+            continue
+        full = os.path.join(TTS_COMPARE_WEB_DIR, name)
+        if not os.path.isfile(full):
+            continue
+        st = os.stat(full)
+        rows.append(
+            {
+                "name": name,
+                "size_bytes": int(st.st_size),
+                "modified_ts": float(st.st_mtime),
+                "url": _build_download_url(full),
+            }
+        )
+    rows.sort(key=lambda x: x["modified_ts"], reverse=True)
+    return JSONResponse({"files": rows, "dir": TTS_COMPARE_WEB_DIR})
+
+
+@app.get("/api/tts-compare-latest")
+async def api_tts_compare_latest():
+    if not LATEST_TTS_COMPARE_INFO:
+        return JSONResponse(
+            {"ok": False, "message": "No generated compare audio yet. Run one TTS turn first."},
+            status_code=404,
+        )
+    return JSONResponse({"ok": True, "latest": LATEST_TTS_COMPARE_INFO})
+
+
 @app.get("/tts-debug", response_class=HTMLResponse)
 async def tts_debug_page():
     if not os.path.exists(TTS_DEBUG_VIEWER_HTML):
@@ -325,6 +383,17 @@ async def tts_debug_page():
             status_code=500,
         )
     with open(TTS_DEBUG_VIEWER_HTML, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+@app.get("/tts-compare", response_class=HTMLResponse)
+async def tts_compare_page():
+    if not os.path.exists(TTS_COMPARE_VIEWER_HTML):
+        return HTMLResponse(
+            "<h3>tts_compare_browser.html が見つかりません。</h3>",
+            status_code=500,
+        )
+    with open(TTS_COMPARE_VIEWER_HTML, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 
@@ -519,6 +588,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
     sentence_enqueued_at = {}
     first_audio_sent_at = None
     worker_stop_count = 0
+    turn_pcm = bytearray()
 
     def _save_debug_wav(path: str, pcm_bytes: bytes):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -848,6 +918,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                         }
                     )
                     await websocket.send_bytes(audio_bytes)
+                    turn_pcm.extend(audio_bytes)
                     send_ms = (time.perf_counter() - send_start) * 1000.0
 
                     if first_audio_sent_at is None:
@@ -944,6 +1015,31 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
         logger.info("[SYNC] all tts_workers joined")
         await sender_task
         logger.info("[SYNC] audio_sender joined")
+
+        if turn_pcm:
+            compare_wav_name = f"turn_{turn_id}_full_stream.wav"
+            compare_wav_path = os.path.join(TTS_COMPARE_WEB_DIR, compare_wav_name)
+            await asyncio.to_thread(_save_debug_wav, compare_wav_path, bytes(turn_pcm))
+            _register_latest_compare_file(
+                compare_wav_path,
+                turn_id=turn_id,
+                answer_text=full_answer,
+                sentence_count=sentence_count,
+                sample_rate=SAMPLE_RATE,
+            )
+            compare_url = _build_download_url(compare_wav_path)
+            logger.info(
+                f"[TTS_COMPARE] saved_stream_copy={compare_wav_path} bytes={len(turn_pcm)} url={compare_url}"
+            )
+            await websocket.send_json(
+                {
+                    "status": "tts_compare_saved",
+                    "download_url": compare_url,
+                    "file_name": compare_wav_name,
+                    "byte_len": len(turn_pcm),
+                    "sample_rate": SAMPLE_RATE,
+                }
+            )
 
         await websocket.send_json({"status": "complete", "answer_text": full_answer})
         logger.info(
