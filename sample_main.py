@@ -49,6 +49,7 @@ TTS_DEBUG_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "tts_debug_brows
 TTS_COMPARE_WEB_DIR = os.path.join(PROCESSING_DIR, "tts_compare")
 TTS_COMPARE_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "tts_compare_browser.html")
 TTS_RAW_WEB_DIR = os.path.join(PROCESSING_DIR, "raw")
+TTS_RAW_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "raw_browser.html")
 os.makedirs(TTS_COMPARE_WEB_DIR, exist_ok=True)
 os.makedirs(TTS_RAW_WEB_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -68,17 +69,17 @@ SAMPLE_SCRIPT_SOURCE = os.getenv("SAMPLE_SCRIPT_SOURCE", "inline").strip().lower
 # Sample video script (default source: inline)
 # Set SAMPLE_SCRIPT_SOURCE=file to force loading from SAMPLE_SCRIPT_PATH.
 INLINE_SCRIPT_TURNS: List[Dict[str, str]] = [
-    {"role": "ai", "text": "私はABC保険の山田と申します。はやししんいち様の携帯電話で間違いございませんでしょうか？"},
+    {"role": "ai", "text": "私はABC保険の山田です。はやししんいち様の携帯電話で間違いございませんでしょうか？"},
     {"role": "human", "text": "はい、私がはやしです。"},
-    {"role": "ai", "text": "ありがとうございます。弊社のホームページからスマートA保険についてのご関心をお寄せいただき、ありがとうございます。お客様のニーズをよりよく理解するためにお電話させていただきました。特に気になる点がございましたら、教えていただけますか？"},
+    {"role": "ai", "text": "ありがとうございます。弊社のホームページからスマートA保険についてのご関心をお寄せいただき、ありがとうございます。お客様のニーズをよりよく理解するためにお電話させていただいております。特に気になる点がございましたら、教えていただけますか？"},
     {"role": "human", "text": "はい、実は親族に癌になった人がいまして、保険に入ってていろいろ助かったみたいで、このたびそちらのがん保険のことを見て気になりました。ちょうどSNSでも同じ保険を勧めていたので、そこから御社のホームページに行って問い合わせしました。"},
     {"role": "ai", "text": "なるほど親族のかたが保険に入ってて助かったとのことですね。それは素晴らしいですね。スマートA保険について、特にどのような点にご興味をお持ちですか？保証内容や"},
     {"role": "human", "text": "はい、スマート保険は保険料は良かったのですが、保証の内容が自分には足りないような気がしています。"},
-    {"role": "ai", "text": "はい。具体的にはどのような保証が必要だと思われますか？ 例えば入院費用や検診費用のカバーなどについてお伺いしたいです。"},
+    {"role": "ai", "text": "わかりました、より充実した保証がほしいとのことですね。具体的にはどのような保証が必要だとお考えですか？ 例えば入院費用や検診費用のカバーなどについてお伺いしたいです。"},
     {"role": "human", "text": "入院費用や検診費用もあればありがたいのですが、親族のかたが抗がん剤治療が長引いて大変だったと聞いたので、抗がん剤治療の補償があったらいいなと思いました。また、最近健康診断で肝臓に問題があるかもしれないと言われたので、自分も早めに備えられたらいいなと思いました。"},
     {"role": "ai", "text": "なるほど、入院費用や検診費用、そして高額な治療に対する補償をお考えなのですね。また、健康診断での結果も気になるところですね。私たちのスマート保険では、高度な治療に対する保証も用意しております。もしよろしければ具体的なプランを提案させていただくためにお会いしてお話しできればと思いますが、いかがですか？お客様にとって便利な日程はございますか？"},
     {"role": "human", "text": "はい、ぜひお願いします。今週の金曜日の午後なら大丈夫です。"},
-    {"role": "ai", "text": "ありがとうございます。今週の金曜日の午後なら大丈夫なのですね。それではお時間は何時にしますか？例えば午後2時や午後3時などいかがですか？"},
+    {"role": "ai", "text": "ありがとうございます。今週の金曜日の午後なら大丈夫なのですね。それではお時間を決めましょう。何時がよろしいですか？ "},
     {"role": "human", "text": "はい、午後2時で大丈夫です。"},
     {"role": "ai", "text": "了解です。今週の金曜日の午後2時によろしくお願いします。何か他にご質問ございますか？"},
     {"role": "human", "text": "特にありません。"},
@@ -402,6 +403,29 @@ async def api_tts_compare_latest():
     return JSONResponse({"ok": True, "latest": LATEST_TTS_COMPARE_INFO})
 
 
+@app.get("/api/raw-files")
+async def api_raw_files():
+    os.makedirs(TTS_RAW_WEB_DIR, exist_ok=True)
+    rows = []
+    for name in os.listdir(TTS_RAW_WEB_DIR):
+        if not name.lower().endswith(".wav"):
+            continue
+        full = os.path.join(TTS_RAW_WEB_DIR, name)
+        if not os.path.isfile(full):
+            continue
+        st = os.stat(full)
+        rows.append(
+            {
+                "name": name,
+                "size_bytes": int(st.st_size),
+                "modified_ts": float(st.st_mtime),
+                "url": _build_download_url(full),
+            }
+        )
+    rows.sort(key=lambda x: x["modified_ts"], reverse=True)
+    return JSONResponse({"files": rows, "dir": TTS_RAW_WEB_DIR})
+
+
 @app.get("/tts-debug", response_class=HTMLResponse)
 async def tts_debug_page():
     if not os.path.exists(TTS_DEBUG_VIEWER_HTML):
@@ -421,6 +445,17 @@ async def tts_compare_page():
             status_code=500,
         )
     with open(TTS_COMPARE_VIEWER_HTML, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+@app.get("/raw", response_class=HTMLResponse)
+async def raw_page():
+    if not os.path.exists(TTS_RAW_VIEWER_HTML):
+        return HTMLResponse(
+            "<h3>raw_browser.html が見つかりません。</h3>",
+            status_code=500,
+        )
+    with open(TTS_RAW_VIEWER_HTML, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 
@@ -540,7 +575,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
     full_answer = ""
     split_pattern = r'(?<=[。！？\n])'
     llm_tts_start = time.perf_counter()
-    TTS_WORKER_COUNT = 2
+    TTS_WORKER_COUNT = int(os.getenv("PERM_TTS_WORKER_COUNT", "2"))
     TTS_PREFETCH_AHEAD = 1
     TTS_MAX_CHUNKS_PER_SENTENCE = int(os.getenv("PERM_TTS_MAX_CHUNKS_PER_SENTENCE", "40"))
     # For sample flow, disable per-sentence truncation to avoid cutting scripted lines.
@@ -564,6 +599,11 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
     TAIL_SILENCE_KEEP_CHUNKS = int(os.getenv("PERM_TTS_TAIL_SILENCE_KEEP_CHUNKS", "1"))
     HEAD_SILENCE_MAX_DROP_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_DROP_CHUNKS", "12"))
     HEAD_SILENCE_MAX_BUFFER_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_BUFFER_CHUNKS", "4"))
+    # Optional: add a tiny sentence-end silence when natural tail is too short.
+    # This check uses pre-trim/raw tail energy so it is independent from tail trimming.
+    SENTENCE_GAP_MS = int(os.getenv("PERM_TTS_SENTENCE_GAP_MS", "0"))
+    SENTENCE_GAP_DBFS = float(os.getenv("PERM_TTS_SENTENCE_GAP_DBFS", "-40.0"))
+    SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS = int(os.getenv("PERM_TTS_SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS", "1"))
     SAVE_DEBUG_AUDIO = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO", "0") == "1"
     SAVE_DEBUG_AUDIO_DIR = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO_DIR", os.path.join(PROCESSING_DIR, "tts_debug"))
     SAVE_RAW_AUDIO = os.getenv("PERM_TTS_SAVE_RAW_AUDIO", "1") == "1"
@@ -595,6 +635,9 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
         f"tail_silence_keep_chunks={TAIL_SILENCE_KEEP_CHUNKS} "
         f"head_silence_max_drop_chunks={HEAD_SILENCE_MAX_DROP_CHUNKS} "
         f"head_silence_max_buffer_chunks={HEAD_SILENCE_MAX_BUFFER_CHUNKS} "
+        f"sentence_gap_ms={SENTENCE_GAP_MS} "
+        f"sentence_gap_dbfs={SENTENCE_GAP_DBFS} "
+        f"sentence_gap_max_tail_low_chunks={SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS} "
         f"tts_text_rewrite={TTS_TEXT_REWRITE} "
         f"save_debug_audio={SAVE_DEBUG_AUDIO} "
         f"save_debug_audio_dir={SAVE_DEBUG_AUDIO_DIR} "
@@ -689,6 +732,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                 head_dropped_chunks = 0
                 sentence_pcm = bytearray()
                 raw_sentence_pcm = bytearray()
+                raw_tail_low_energy_chunks = 0
 
                 def _calc_chunk_dbfs(pcm_chunk: bytes):
                     if not pcm_chunk:
@@ -757,6 +801,11 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                             termination_reason = "stream_eos"
                             break
                         raw_sentence_pcm.extend(pcm_chunk)
+                        raw_dbfs_now = _calc_chunk_dbfs(pcm_chunk)
+                        if raw_dbfs_now is not None and raw_dbfs_now < SENTENCE_GAP_DBFS:
+                            raw_tail_low_energy_chunks += 1
+                        else:
+                            raw_tail_low_energy_chunks = 0
                         if TAIL_SILENCE_TRIM:
                             chunk_dbfs_now = _calc_chunk_dbfs(pcm_chunk)
                             if chunk_dbfs_now is not None and chunk_dbfs_now < low_energy_dbfs:
@@ -877,6 +926,33 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                         )
 
                 total_tts_ms = (time.perf_counter() - sentence_start) * 1000.0
+                # If raw tail is too "hard" (too few low-energy chunks), add short silence gap.
+                if SENTENCE_GAP_MS > 0 and raw_tail_low_energy_chunks <= SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS:
+                    gap_samples = int((SAMPLE_RATE * SENTENCE_GAP_MS) / 1000)
+                    if gap_samples > 0:
+                        gap_pcm = (np.zeros(gap_samples, dtype=np.int16)).tobytes()
+                        if gap_pcm:
+                            tts_chunk_count += 1
+                            total_len += len(gap_pcm)
+                            sentence_pcm.extend(gap_pcm)
+                            await audio_queue.put(
+                                {
+                                    "type": "chunk",
+                                    "sentence_idx": idx,
+                                    "tts_chunk_idx": tts_chunk_count,
+                                    "worker_id": worker_id,
+                                    "audio_bytes": gap_pcm,
+                                    "total_bytes": 0,
+                                    "chunk_gen_ms": 0.0,
+                                    "created_at": time.perf_counter(),
+                                }
+                            )
+                            logger.info(
+                                f"[TTS_GAP] worker={worker_id} sentence={idx} "
+                                f"added_silence_ms={SENTENCE_GAP_MS} gap_bytes={len(gap_pcm)} "
+                                f"raw_tail_low_energy_chunks={raw_tail_low_energy_chunks} "
+                                f"threshold_dbfs={SENTENCE_GAP_DBFS:.1f}"
+                            )
                 await audio_queue.put(
                     {
                         "type": "done",
@@ -1501,7 +1577,6 @@ async def get_root():
                         processAudioQueue();
                         continue;
                     }
-
                     const doneInfo = sentenceDoneMap.get(expectedSentenceId);
                     if (doneInfo && expectedChunkId > doneInfo.lastChunkId) {
                         expectedSentenceId += 1;

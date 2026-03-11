@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import traceback
+import hashlib
 
 import numpy as np
 import scipy.signal
@@ -335,10 +336,15 @@ def synthesize_speech_to_memory_stream_for_worker(text_to_speak: str, worker_id:
     if prompt_text:
         print("[WARN] prompt_text/instruct is ignored in streaming mode.")
 
+    text_hash = hashlib.sha1(text_to_speak.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    stream_id = f"w{worker_id}-{int(time.time() * 1000)}-{text_hash}"
     if QWEN3_DIAG:
         snap = get_tts_debug_snapshot(worker_id)
-        preview = text_to_speak[:64].replace("\n", "\\n")
-        print(f"[TTS_DIAG] stream_start worker={worker_id} text_len={len(text_to_speak)} preview={preview!r} snap={snap}")
+        preview = text_to_speak[:120].replace("\n", "\\n")
+        print(
+            f"[TTS_DIAG] stream_start stream_id={stream_id} worker={worker_id} "
+            f"text_len={len(text_to_speak)} preview={preview!r} text={text_to_speak!r} snap={snap}"
+        )
 
     _ensure_model_warm(tts_model, model_idx=worker_id)
     max_new_tokens = _estimate_max_new_tokens(text_to_speak)
@@ -364,15 +370,45 @@ def synthesize_speech_to_memory_stream_for_worker(text_to_speak: str, worker_id:
         chunk_size=chunk_size,
         xvec_only=QWEN3_XVECTOR_ONLY,
     )
-
-    for wav_chunk, sr, _timing in chunk_iter:
-        wav_chunk = np.asarray(wav_chunk, dtype=np.float32)
-        if wav_chunk.size == 0:
-            continue
-        wav_chunk = _resample_if_needed(wav_chunk, int(sr), DEFAULT_PARAMS["target_sr"])
-        pcm = _to_pcm16_bytes(wav_chunk)
-        if pcm:
-            yield pcm
+    chunk_count = 0
+    total_pcm_bytes = 0
+    last_stop_reason = None
+    try:
+        for wav_chunk, sr, timing in chunk_iter:
+            chunk_count += 1
+            if isinstance(timing, dict):
+                last_stop_reason = timing.get("stop_reason", last_stop_reason)
+            wav_chunk = np.asarray(wav_chunk, dtype=np.float32)
+            if wav_chunk.size == 0:
+                if QWEN3_DIAG:
+                    print(
+                        f"[TTS_DIAG] stream_chunk stream_id={stream_id} worker={worker_id} "
+                        f"chunk={chunk_count} empty=1 timing={timing}"
+                    )
+                continue
+            wav_chunk = _resample_if_needed(wav_chunk, int(sr), DEFAULT_PARAMS["target_sr"])
+            pcm = _to_pcm16_bytes(wav_chunk)
+            pcm_len = len(pcm) if pcm else 0
+            total_pcm_bytes += pcm_len
+            if QWEN3_STAGE_TIMING or QWEN3_DIAG:
+                print(
+                    f"[TTS_DIAG] stream_chunk stream_id={stream_id} worker={worker_id} "
+                    f"chunk={chunk_count} wav_samples={int(wav_chunk.size)} pcm_bytes={pcm_len} timing={timing}"
+                )
+            if pcm:
+                yield pcm
+        if QWEN3_DIAG:
+            print(
+                f"[TTS_DIAG] stream_end stream_id={stream_id} worker={worker_id} "
+                f"text_len={len(text_to_speak)} chunks={chunk_count} total_pcm_bytes={total_pcm_bytes} "
+                f"last_stop_reason={last_stop_reason or 'unknown'}"
+            )
+    except Exception as e:
+        print(
+            f"[TTS_DIAG] stream_exception stream_id={stream_id} worker={worker_id} "
+            f"text_len={len(text_to_speak)} chunks={chunk_count} total_pcm_bytes={total_pcm_bytes} err={e}"
+        )
+        raise
 
 
 def synthesize_speech_to_memory_with_timing(text_to_speak: str):
