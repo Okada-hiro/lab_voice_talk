@@ -48,7 +48,9 @@ TTS_DEBUG_WEB_DIR = os.path.join(PROCESSING_DIR, "tts_debug")
 TTS_DEBUG_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "tts_debug_browser.html")
 TTS_COMPARE_WEB_DIR = os.path.join(PROCESSING_DIR, "tts_compare")
 TTS_COMPARE_VIEWER_HTML = os.path.join(os.path.dirname(__file__), "tts_compare_browser.html")
+TTS_RAW_WEB_DIR = os.path.join(PROCESSING_DIR, "raw")
 os.makedirs(TTS_COMPARE_WEB_DIR, exist_ok=True)
+os.makedirs(TTS_RAW_WEB_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info(f"Using Device: {DEVICE}")
 SYNC_ROOT_DIR = os.path.abspath(os.getenv("RUNPOD_SYNC_ROOT", "."))
@@ -66,17 +68,17 @@ SAMPLE_SCRIPT_SOURCE = os.getenv("SAMPLE_SCRIPT_SOURCE", "inline").strip().lower
 # Sample video script (default source: inline)
 # Set SAMPLE_SCRIPT_SOURCE=file to force loading from SAMPLE_SCRIPT_PATH.
 INLINE_SCRIPT_TURNS: List[Dict[str, str]] = [
-    {"role": "ai", "text": "私はABC保険の山田と申します。はやし しんいち様の携帯電話で間違いございませんでしょうか？"},
+    {"role": "ai", "text": "私はABC保険の山田と申します。はやししんいち様の携帯電話で間違いございませんでしょうか？"},
     {"role": "human", "text": "はい、私がはやしです。"},
     {"role": "ai", "text": "ありがとうございます。弊社のホームページからスマートA保険についてのご関心をお寄せいただき、ありがとうございます。お客様のニーズをよりよく理解するためにお電話させていただきました。特に気になる点がございましたら、教えていただけますか？"},
     {"role": "human", "text": "はい、実は親族に癌になった人がいまして、保険に入ってていろいろ助かったみたいで、このたびそちらのがん保険のことを見て気になりました。ちょうどSNSでも同じ保険を勧めていたので、そこから御社のホームページに行って問い合わせしました。"},
-    {"role": "ai", "text": "なるほど、親族のかたが保険に入ってて助かったとのことですね。それは素晴らしいですね。スマートA保険について、特にどのような点にご興味をお持ちですか？保証内容や。。。。"},
+    {"role": "ai", "text": "なるほど親族のかたが保険に入ってて助かったとのことですね。それは素晴らしいですね。スマートA保険について、特にどのような点にご興味をお持ちですか？保証内容や"},
     {"role": "human", "text": "はい、スマート保険は保険料は良かったのですが、保証の内容が自分には足りないような気がしています。"},
-    {"role": "ai", "text": "はい、具体的にはどのような保証が必要だと思われますか？ 例えば入院費用や検診費用のカバーなどについてお伺いしたいです。"},
+    {"role": "ai", "text": "はい。具体的にはどのような保証が必要だと思われますか？ 例えば入院費用や検診費用のカバーなどについてお伺いしたいです。"},
     {"role": "human", "text": "入院費用や検診費用もあればありがたいのですが、親族のかたが抗がん剤治療が長引いて大変だったと聞いたので、抗がん剤治療の補償があったらいいなと思いました。また、最近健康診断で肝臓に問題があるかもしれないと言われたので、自分も早めに備えられたらいいなと思いました。"},
     {"role": "ai", "text": "なるほど、入院費用や検診費用、そして高額な治療に対する補償をお考えなのですね。また、健康診断での結果も気になるところですね。私たちのスマート保険では、高度な治療に対する保証も用意しております。もしよろしければ具体的なプランを提案させていただくためにお会いしてお話しできればと思いますが、いかがですか？お客様にとって便利な日程はございますか？"},
     {"role": "human", "text": "はい、ぜひお願いします。今週の金曜日の午後なら大丈夫です。"},
-    {"role": "ai", "text": "ありがとうございます。今週の金曜日の午後なら大丈夫なのですね。それではお時間は何時にしましょうか？例えば午後2時や午後3時などいかがですか？"},
+    {"role": "ai", "text": "ありがとうございます。今週の金曜日の午後なら大丈夫なのですね。それではお時間は何時にしますか？例えば午後2時や午後3時などいかがですか？"},
     {"role": "human", "text": "はい、午後2時で大丈夫です。"},
     {"role": "ai", "text": "了解です。今週の金曜日の午後2時によろしくお願いします。何か他にご質問ございますか？"},
     {"role": "human", "text": "特にありません。"},
@@ -301,6 +303,31 @@ def _register_latest_compare_file(abs_path: str, turn_id: int, answer_text: str,
         "sentence_count": sentence_count,
         "answer_text": answer_text,
     }
+
+
+def _text_to_audio_stem(text: str, max_len: int = 80) -> str:
+    s = (text or "").strip()
+    # Keep Japanese text readable, only remove path/invalid chars.
+    s = s.replace("/", " ").replace("\\", " ").replace(":", " ")
+    s = s.replace("*", " ").replace("?", " ").replace("\"", " ")
+    s = s.replace("<", " ").replace(">", " ").replace("|", " ")
+    s = re.sub(r"\s+", " ", s).strip().rstrip(".")
+    s = s[:max_len].strip()
+    return s or "tts_audio"
+
+
+def _unique_wav_path(base_dir: str, stem: str) -> str:
+    os.makedirs(base_dir, exist_ok=True)
+    clean_stem = _text_to_audio_stem(stem)
+    candidate = os.path.join(base_dir, f"{clean_stem}.wav")
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        candidate = os.path.join(base_dir, f"{clean_stem}_{n}.wav")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
 
 
 @app.post("/admin/upload-file")
@@ -539,6 +566,8 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
     HEAD_SILENCE_MAX_BUFFER_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_BUFFER_CHUNKS", "4"))
     SAVE_DEBUG_AUDIO = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO", "0") == "1"
     SAVE_DEBUG_AUDIO_DIR = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO_DIR", os.path.join(PROCESSING_DIR, "tts_debug"))
+    SAVE_RAW_AUDIO = os.getenv("PERM_TTS_SAVE_RAW_AUDIO", "1") == "1"
+    SAVE_RAW_AUDIO_DIR = os.getenv("PERM_TTS_SAVE_RAW_AUDIO_DIR", os.path.join(PROCESSING_DIR, "raw"))
     TTS_TEXT_REWRITE = os.getenv("PERM_TTS_TEXT_REWRITE", "1") == "1"
     turn_id = int(time.time() * 1000)
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
@@ -568,7 +597,9 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
         f"head_silence_max_buffer_chunks={HEAD_SILENCE_MAX_BUFFER_CHUNKS} "
         f"tts_text_rewrite={TTS_TEXT_REWRITE} "
         f"save_debug_audio={SAVE_DEBUG_AUDIO} "
-        f"save_debug_audio_dir={SAVE_DEBUG_AUDIO_DIR}"
+        f"save_debug_audio_dir={SAVE_DEBUG_AUDIO_DIR} "
+        f"save_raw_audio={SAVE_RAW_AUDIO} "
+        f"save_raw_audio_dir={SAVE_RAW_AUDIO_DIR}"
     )
     logger.info(
         f"[SCRIPT_TTS_FLOW] start answer_text_len={len(answer_text)} "
@@ -657,6 +688,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                 emitted_non_silence = False
                 head_dropped_chunks = 0
                 sentence_pcm = bytearray()
+                raw_sentence_pcm = bytearray()
 
                 def _calc_chunk_dbfs(pcm_chunk: bytes):
                     if not pcm_chunk:
@@ -724,6 +756,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                         if pcm_chunk is None:
                             termination_reason = "stream_eos"
                             break
+                        raw_sentence_pcm.extend(pcm_chunk)
                         if TAIL_SILENCE_TRIM:
                             chunk_dbfs_now = _calc_chunk_dbfs(pcm_chunk)
                             if chunk_dbfs_now is not None and chunk_dbfs_now < low_energy_dbfs:
@@ -817,6 +850,8 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                         tts_chunk_count = 1
                         total_len = len(pcm_all)
                         sentence_pcm = bytearray(pcm_all)
+                        if not raw_sentence_pcm:
+                            raw_sentence_pcm = bytearray(pcm_all)
                         if first_chunk_ready_ms is None:
                             first_chunk_ready_ms = (time.perf_counter() - sentence_start) * 1000.0
                         await audio_queue.put(
@@ -863,10 +898,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                     f"total_tts_ms={total_tts_ms:.1f} termination={termination_reason}"
                 )
                 if SAVE_DEBUG_AUDIO and total_len > 0:
-                    debug_wav_path = os.path.join(
-                        SAVE_DEBUG_AUDIO_DIR,
-                        f"turn_{turn_id}_sentence_{idx:02d}_worker_{worker_id}_bytes_{total_len}.wav",
-                    )
+                    debug_wav_path = _unique_wav_path(SAVE_DEBUG_AUDIO_DIR, tts_phrase)
                     try:
                         await asyncio.to_thread(_save_debug_wav, debug_wav_path, bytes(sentence_pcm))
                         logger.info(
@@ -876,6 +908,19 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                     except Exception as save_e:
                         logger.error(
                             f"[TTS_DEBUG_AUDIO] worker={worker_id} sentence={idx} save_failed: {save_e}",
+                            exc_info=True,
+                        )
+                if SAVE_RAW_AUDIO and len(raw_sentence_pcm) > 0:
+                    raw_wav_path = _unique_wav_path(SAVE_RAW_AUDIO_DIR, f"{tts_phrase}__raw")
+                    try:
+                        await asyncio.to_thread(_save_debug_wav, raw_wav_path, bytes(raw_sentence_pcm))
+                        logger.info(
+                            f"[TTS_RAW_AUDIO] worker={worker_id} sentence={idx} "
+                            f"saved_raw_wav={raw_wav_path} bytes={len(raw_sentence_pcm)}"
+                        )
+                    except Exception as raw_save_e:
+                        logger.error(
+                            f"[TTS_RAW_AUDIO] worker={worker_id} sentence={idx} raw_save_failed: {raw_save_e}",
                             exc_info=True,
                         )
                 if AUDIO_ENERGY_DIAG:
@@ -1017,8 +1062,8 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
         logger.info("[SYNC] audio_sender joined")
 
         if turn_pcm:
-            compare_wav_name = f"turn_{turn_id}_full_stream.wav"
-            compare_wav_path = os.path.join(TTS_COMPARE_WEB_DIR, compare_wav_name)
+            compare_wav_path = _unique_wav_path(TTS_COMPARE_WEB_DIR, full_answer)
+            compare_wav_name = os.path.basename(compare_wav_path)
             await asyncio.to_thread(_save_debug_wav, compare_wav_path, bytes(turn_pcm))
             _register_latest_compare_file(
                 compare_wav_path,

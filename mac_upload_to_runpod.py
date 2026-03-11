@@ -49,6 +49,11 @@ def parse_args():
         help="Local file paths to upload",
     )
     p.add_argument("--timeout", type=int, default=120, help="Request timeout in seconds")
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print progress logs",
+    )
     return p.parse_args()
 
 
@@ -91,10 +96,16 @@ def main():
         raise ValueError("token is required. Use --token or RUNPOD_SYNC_TOKEN.")
 
     base_url = normalize_base_url(args.host)
-    # Enforce port 8000 if user passed host without explicit port/path.
-    if ":" not in base_url.split("://", 1)[1].split("/", 1)[0]:
+    # Do NOT force :8000 for RunPod proxy hostnames like:
+    #   xxxx-8000.proxy.runpod.net
+    # They already encode the port in the hostname.
+    host_part = base_url.split("://", 1)[1].split("/", 1)[0]
+    if ":" not in host_part and ".proxy.runpod.net" not in host_part:
         base_url = f"{base_url}:8000"
     endpoint = f"{base_url}/admin/upload-file"
+
+    if args.verbose:
+        print(f"[INFO] endpoint={endpoint}")
 
     base_dir = Path(args.base_dir)
     local_files = [Path(x) for x in args.files]
@@ -107,6 +118,8 @@ def main():
     with requests.Session() as session:
         for p in local_files:
             remote_path = make_remote_path(base_dir, p, args.remote_root)
+            if args.verbose:
+                print(f"[INFO] uploading {p} -> {remote_path}")
             result = upload_one(session, endpoint, args.token, p, remote_path, args.timeout)
             size = result.get("bytes", "?")
             print(f"OK {p} -> {remote_path} ({size} bytes)")
