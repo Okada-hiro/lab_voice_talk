@@ -1,4 +1,4 @@
-#今はこれ! 2月20日 一旦安定する
+#sample! 3月4日 一旦安定する
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, HTTPException
@@ -14,6 +14,7 @@ import io
 import re
 import time
 import wave
+import subprocess
 from typing import List, Dict, Optional
 
 # --- ロギング設定 ---
@@ -56,6 +57,30 @@ app = FastAPI()
 app.mount(f"/download", StaticFiles(directory=PROCESSING_DIR), name="download")
 
 SAMPLE_SCRIPT_PATH = os.getenv("SAMPLE_SCRIPT_PATH", os.path.join(os.path.dirname(__file__), "原稿.rtf"))
+SAMPLE_SCRIPT_SOURCE = os.getenv("SAMPLE_SCRIPT_SOURCE", "inline").strip().lower()
+
+# Sample video script (default source: inline)
+# Set SAMPLE_SCRIPT_SOURCE=file to force loading from SAMPLE_SCRIPT_PATH.
+INLINE_SCRIPT_TURNS: List[Dict[str, str]] = [
+    {"role": "ai", "text": "私はABC保険の山田と申します。はやし しんいち様の携帯電話で間違いございませんでしょうか？"},
+    {"role": "human", "text": "はい、私がはやしです。"},
+    {"role": "ai", "text": "ありがとうございます。弊社のホームページからスマートA保険についてのご関心をお寄せいただき、ありがとうございます。お客様のニーズをよりよく理解するためにお電話させていただきました。特に気になる点がございましたら、教えていただけますか？"},
+    {"role": "human", "text": "はい、実は親族に癌になった人がいまして、保険に入ってていろいろ助かったみたいで、このたびそちらのがん保険のことを見て気になりました。ちょうどSNSでも同じ保険を勧めていたので、そこから御社のホームページに行って問い合わせしました。"},
+    {"role": "ai", "text": "なるほど、親族のかたが保険に入ってて助かったとのことですね。それは素晴らしいですね。スマートA保険について、特にどのような点にご興味をお持ちですか？保証内容や。。。。"},
+    {"role": "human", "text": "はい、スマート保険は保険料は良かったのですが、保証の内容が自分には足りないような気がしています。"},
+    {"role": "ai", "text": "はい、具体的にはどのような保証が必要だと思われますか？ 例えば入院費用や検診費用のカバーなどについてお伺いしたいです。"},
+    {"role": "human", "text": "入院費用や検診費用もあればありがたいのですが、親族のかたが抗がん剤治療が長引いて大変だったと聞いたので、抗がん剤治療の補償があったらいいなと思いました。また、最近健康診断で肝臓に問題があるかもしれないと言われたので、自分も早めに備えられたらいいなと思いました。"},
+    {"role": "ai", "text": "なるほど、入院費用や検診費用、そして高額な治療に対する補償をお考えなのですね。また、健康診断での結果も気になるところですね。私たちのスマート保険では、高度な治療に対する保証も用意しております。もしよろしければ具体的なプランを提案させていただくためにお会いしてお話しできればと思いますが、いかがですか？お客様にとって便利な日程はございますか？"},
+    {"role": "human", "text": "はい、ぜひお願いします。今週の金曜日の午後なら大丈夫です。"},
+    {"role": "ai", "text": "ありがとうございます。今週の金曜日の午後なら大丈夫なのですね。それではお時間は何時にしましょうか？例えば午後2時や午後3時などいかがですか？"},
+    {"role": "human", "text": "はい、午後2時で大丈夫です。"},
+    {"role": "ai", "text": "了解です。今週の金曜日の午後2時によろしくお願いします。何か他にご質問ございますか？"},
+    {"role": "human", "text": "特にありません。"},
+    {"role": "ai", "text": "もし何か気になる点ございましたら、いつでもお気軽にお問い合わせください。"},
+    {"role": "human", "text": "ありがとうございます。"},
+    {"role": "ai", "text": "では失礼いたします。"},
+    {"role": "human", "text": "失礼します。"},
+]
 
 
 def _decode_rtf_unicode(raw: str) -> str:
@@ -82,28 +107,71 @@ def _rtf_to_plain_text(raw: str) -> str:
     return text.strip()
 
 
+def _rtf_to_plain_text_via_textutil(path: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["textutil", "-convert", "txt", "-stdout", path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return proc.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _cleanup_script_text(s: str) -> str:
+    t = (s or "").replace("\u3000", " ").strip()
+    # Remove unnatural inter-character spaces (e.g. "私 、 A B C")
+    t = re.sub(
+        r"(?<=[\u3040-\u30ff\u3400-\u9fffA-Za-z0-9])\s+(?=[\u3040-\u30ff\u3400-\u9fffA-Za-z0-9])",
+        "",
+        t,
+    )
+    t = re.sub(r"\s+([。、，,.！？!?\)])", r"\1", t)
+    t = re.sub(r"([\(\[「『])\s+", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t)
+    return t.strip()
+
+
 def _load_sample_turns(path: str) -> List[Dict[str, str]]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"sample script not found: {path}")
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         raw = f.read()
-    plain = _rtf_to_plain_text(raw) if path.lower().endswith(".rtf") else raw
+    if path.lower().endswith(".rtf"):
+        plain = _rtf_to_plain_text_via_textutil(path) or _rtf_to_plain_text(raw)
+    else:
+        plain = raw
     turns: List[Dict[str, str]] = []
-    for line in plain.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("AI:"):
-            turns.append({"role": "ai", "text": s[3:].strip()})
-        elif s.startswith("人間:"):
-            turns.append({"role": "human", "text": s[3:].strip()})
+    label_re = re.compile(r"(AI|人間)\s*[:：]")
+    matches = list(label_re.finditer(plain))
+    for i, m in enumerate(matches):
+        role = "ai" if m.group(1) == "AI" else "human"
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(plain)
+        text = _cleanup_script_text(plain[start:end])
+        if text:
+            turns.append({"role": role, "text": text})
     if not turns:
         raise ValueError("no script turns found (expected lines starting with 'AI:' or '人間:').")
     return turns
 
 
-SCRIPT_TURNS = _load_sample_turns(SAMPLE_SCRIPT_PATH)
-logger.info(f"[SAMPLE_SCRIPT] loaded turns={len(SCRIPT_TURNS)} path={SAMPLE_SCRIPT_PATH}")
+if SAMPLE_SCRIPT_SOURCE == "file":
+    SCRIPT_TURNS = _load_sample_turns(SAMPLE_SCRIPT_PATH)
+    logger.info(f"[SAMPLE_SCRIPT] loaded turns={len(SCRIPT_TURNS)} source=file path={SAMPLE_SCRIPT_PATH}")
+else:
+    SCRIPT_TURNS = INLINE_SCRIPT_TURNS
+    logger.info(f"[SAMPLE_SCRIPT] loaded turns={len(SCRIPT_TURNS)} source=inline")
+ai_count = sum(1 for t in SCRIPT_TURNS if t["role"] == "ai")
+human_count = sum(1 for t in SCRIPT_TURNS if t["role"] == "human")
+logger.info(f"[SAMPLE_SCRIPT] role_counts ai={ai_count} human={human_count}")
+if SCRIPT_TURNS:
+    logger.info(
+        f"[SAMPLE_SCRIPT] first_turn role={SCRIPT_TURNS[0]['role']} len={len(SCRIPT_TURNS[0]['text'])} "
+        f"text={SCRIPT_TURNS[0]['text'][:80]!r}"
+    )
 
 
 def _normalize_for_compare(text: str) -> str:
@@ -113,14 +181,38 @@ def _normalize_for_compare(text: str) -> str:
     return t
 
 
+def _to_tts_text(text: str) -> str:
+    t = text or ""
+    # Honorific reading stabilization (e.g. "はやし様" -> "はやしさま")
+    t = re.sub(r"([^\s。、，,.！？!?「」『』（）()]+)様", r"\1さま", t)
+    return t
+
+
+def _split_by_length_with_punctuation(buffer: str, min_chars: int = 60) -> tuple[list[str], str]:
+    emitted: list[str] = []
+    punct_re = re.compile(r"[。！？\n]")
+    work = buffer
+    while len(work) > min_chars:
+        m = punct_re.search(work, pos=min_chars)
+        if not m:
+            break
+        cut = m.end()
+        chunk = work[:cut].strip()
+        if chunk:
+            emitted.append(chunk)
+        work = work[cut:]
+    return emitted, work
+
+
 def _consume_ai_block(state: dict) -> str:
     idx = state["cursor"]
-    ai_lines: List[str] = []
-    while idx < len(SCRIPT_TURNS) and SCRIPT_TURNS[idx]["role"] == "ai":
-        ai_lines.append(SCRIPT_TURNS[idx]["text"])
+    while idx < len(SCRIPT_TURNS) and SCRIPT_TURNS[idx]["role"] != "ai":
         idx += 1
-    state["cursor"] = idx
-    return "\n".join(ai_lines).strip()
+    if idx >= len(SCRIPT_TURNS):
+        state["cursor"] = idx
+        return ""
+    state["cursor"] = idx + 1
+    return SCRIPT_TURNS[idx]["text"].strip()
 
 
 def _consume_human_then_ai(state: dict, user_text: str) -> str:
@@ -355,6 +447,8 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
     TTS_WORKER_COUNT = 2
     TTS_PREFETCH_AHEAD = 1
     TTS_MAX_CHUNKS_PER_SENTENCE = int(os.getenv("PERM_TTS_MAX_CHUNKS_PER_SENTENCE", "40"))
+    # For sample flow, disable per-sentence truncation to avoid cutting scripted lines.
+    EFFECTIVE_TTS_CHUNK_CAP = 0
     STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
     STREAM_DECODE_WINDOW_FRAMES = int(os.getenv("PERM_DECODE_WINDOW_FRAMES", "80"))
     DETAILED_TIMING = os.getenv("PERM_DETAILED_TIMING", "0") == "1"
@@ -376,6 +470,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
     HEAD_SILENCE_MAX_BUFFER_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_BUFFER_CHUNKS", "4"))
     SAVE_DEBUG_AUDIO = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO", "0") == "1"
     SAVE_DEBUG_AUDIO_DIR = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO_DIR", os.path.join(PROCESSING_DIR, "tts_debug"))
+    TTS_TEXT_REWRITE = os.getenv("PERM_TTS_TEXT_REWRITE", "1") == "1"
     turn_id = int(time.time() * 1000)
     stream_cfg = getattr(tts_module, "DEFAULT_STREAM_PARAMS", {})
     if isinstance(stream_cfg, dict):
@@ -393,6 +488,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
         f"repetition_penalty_window={stream_cfg.get('repetition_penalty_window')} "
         f"tts_workers={TTS_WORKER_COUNT} prefetch_ahead={TTS_PREFETCH_AHEAD} "
         f"max_chunks_per_sentence={TTS_MAX_CHUNKS_PER_SENTENCE} "
+        f"effective_max_chunks_per_sentence={EFFECTIVE_TTS_CHUNK_CAP} "
         f"audio_energy_diag={AUDIO_ENERGY_DIAG} "
         f"trim_tail_silence={TAIL_SILENCE_TRIM} "
         f"tail_silence_dbfs={TAIL_SILENCE_DBFS} "
@@ -401,6 +497,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
         f"tail_silence_keep_chunks={TAIL_SILENCE_KEEP_CHUNKS} "
         f"head_silence_max_drop_chunks={HEAD_SILENCE_MAX_DROP_CHUNKS} "
         f"head_silence_max_buffer_chunks={HEAD_SILENCE_MAX_BUFFER_CHUNKS} "
+        f"tts_text_rewrite={TTS_TEXT_REWRITE} "
         f"save_debug_audio={SAVE_DEBUG_AUDIO} "
         f"save_debug_audio_dir={SAVE_DEBUG_AUDIO_DIR}"
     )
@@ -458,6 +555,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                     return
 
                 idx, phrase = item
+                tts_phrase = _to_tts_text(phrase) if TTS_TEXT_REWRITE else phrase
                 sentence_start = time.perf_counter()
                 queue_wait_ms = (sentence_start - sentence_enqueued_at.get(idx, sentence_start)) * 1000.0
                 logger.info(
@@ -465,6 +563,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                     f"stage=tts_start text_len={len(phrase)} queue_wait_ms={queue_wait_ms:.1f}"
                 )
                 phrase_preview = phrase[:80].replace("\n", "\\n")
+                tts_phrase_preview = tts_phrase[:80].replace("\n", "\\n")
                 tts_snapshot = None
                 if hasattr(tts_module, "get_tts_debug_snapshot"):
                     try:
@@ -473,7 +572,9 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                         tts_snapshot = {"snapshot_error": True}
                 logger.info(
                     f"[TTS_DIAG] worker={worker_id} sentence={idx} "
-                    f"phrase={phrase_preview!r} phrase_repr={phrase!r} model={tts_snapshot}"
+                    f"phrase={phrase_preview!r} phrase_repr={phrase!r} "
+                    f"tts_phrase={tts_phrase_preview!r} tts_phrase_repr={tts_phrase!r} "
+                    f"model={tts_snapshot}"
                 )
                 total_len = 0
                 tts_chunk_count = 0
@@ -539,7 +640,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                     return chunk_dbfs_local
 
                 try:
-                    stream_gen = synthesize_speech_to_memory_stream_for_worker(phrase, worker_id)
+                    stream_gen = synthesize_speech_to_memory_stream_for_worker(tts_phrase, worker_id)
                     while True:
                         # (E) to_thread / スケジューリング固定費の近似
                         sched_probe_start = time.perf_counter()
@@ -583,10 +684,11 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                             await _emit_pcm_chunk(pcm_chunk, chunk_gen_ms)
                         else:
                             await _emit_pcm_chunk(pcm_chunk, chunk_gen_ms)
-                        if tts_chunk_count >= TTS_MAX_CHUNKS_PER_SENTENCE:
+                        if EFFECTIVE_TTS_CHUNK_CAP > 0 and tts_chunk_count >= EFFECTIVE_TTS_CHUNK_CAP:
                             logger.warning(
                                 f"[TTS_TIMING] worker={worker_id} sentence={idx} "
-                                f"hit_chunk_cap={TTS_MAX_CHUNKS_PER_SENTENCE} -> truncating sentence"
+                                f"hit_chunk_cap={EFFECTIVE_TTS_CHUNK_CAP} -> truncating sentence "
+                                f"(raw_cap={TTS_MAX_CHUNKS_PER_SENTENCE})"
                             )
                             termination_reason = "chunk_cap"
                             break
@@ -637,7 +739,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                     fallback_start = time.perf_counter()
                     pcm_all = await asyncio.to_thread(
                         synthesize_speech_to_memory_for_worker,
-                        phrase,
+                        tts_phrase,
                         worker_id,
                     )
                     fallback_ms = (time.perf_counter() - fallback_start) * 1000.0
@@ -815,7 +917,7 @@ async def handle_llm_tts(answer_text: str, websocket: WebSocket):
                             f"text_queue_size={text_queue.qsize()}"
                         )
                 text_buffer = sentences[-1]
-        
+
         if text_buffer.strip():
             sentence_count += 1
             await websocket.send_json({"status": "reply_chunk", "text_chunk": text_buffer})
@@ -871,7 +973,7 @@ async def websocket_endpoint(websocket: WebSocket):
         vad_model, 
         threshold=0.95, 
         sampling_rate=16000, 
-        min_silence_duration_ms=200, 
+        min_silence_duration_ms=400, 
         speech_pad_ms=50
     )
 
