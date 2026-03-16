@@ -1,4 +1,4 @@
-#今はこれ! 2月20日 一旦安定する
+#今はこれ! 3月4日 
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, HTTPException
@@ -264,7 +264,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     full_answer = ""
     split_pattern = r'(?<=[。！？\n])'
     llm_tts_start = time.perf_counter()
-    TTS_WORKER_COUNT = 2
+    TTS_WORKER_COUNT = int(os.getenv("PERM_TTS_WORKER_COUNT", "2"))
     TTS_PREFETCH_AHEAD = 1
     TTS_MAX_CHUNKS_PER_SENTENCE = int(os.getenv("PERM_TTS_MAX_CHUNKS_PER_SENTENCE", "40"))
     STREAM_EMIT_EVERY_FRAMES = int(os.getenv("PERM_EMIT_EVERY_FRAMES", "4"))
@@ -286,6 +286,10 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
     TAIL_SILENCE_KEEP_CHUNKS = int(os.getenv("PERM_TTS_TAIL_SILENCE_KEEP_CHUNKS", "1"))
     HEAD_SILENCE_MAX_DROP_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_DROP_CHUNKS", "12"))
     HEAD_SILENCE_MAX_BUFFER_CHUNKS = int(os.getenv("PERM_TTS_HEAD_SILENCE_MAX_BUFFER_CHUNKS", "4"))
+    # Optional: inject a small sentence-end gap when natural tail is too short.
+    SENTENCE_GAP_MS = int(os.getenv("PERM_TTS_SENTENCE_GAP_MS", "0"))
+    SENTENCE_GAP_DBFS = float(os.getenv("PERM_TTS_SENTENCE_GAP_DBFS", "-40.0"))
+    SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS = int(os.getenv("PERM_TTS_SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS", "1"))
     SAVE_DEBUG_AUDIO = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO", "0") == "1"
     SAVE_DEBUG_AUDIO_DIR = os.getenv("PERM_TTS_SAVE_DEBUG_AUDIO_DIR", os.path.join(PROCESSING_DIR, "tts_debug"))
     turn_id = int(time.time() * 1000)
@@ -313,6 +317,9 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
         f"tail_silence_keep_chunks={TAIL_SILENCE_KEEP_CHUNKS} "
         f"head_silence_max_drop_chunks={HEAD_SILENCE_MAX_DROP_CHUNKS} "
         f"head_silence_max_buffer_chunks={HEAD_SILENCE_MAX_BUFFER_CHUNKS} "
+        f"sentence_gap_ms={SENTENCE_GAP_MS} "
+        f"sentence_gap_dbfs={SENTENCE_GAP_DBFS} "
+        f"sentence_gap_max_tail_low_chunks={SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS} "
         f"save_debug_audio={SAVE_DEBUG_AUDIO} "
         f"save_debug_audio_dir={SAVE_DEBUG_AUDIO_DIR}"
     )
@@ -398,6 +405,7 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                 emitted_non_silence = False
                 head_dropped_chunks = 0
                 sentence_pcm = bytearray()
+                raw_tail_low_energy_chunks = 0
 
                 def _calc_chunk_dbfs(pcm_chunk: bytes):
                     if not pcm_chunk:
@@ -465,6 +473,11 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         if pcm_chunk is None:
                             termination_reason = "stream_eos"
                             break
+                        raw_dbfs_now = _calc_chunk_dbfs(pcm_chunk)
+                        if raw_dbfs_now is not None and raw_dbfs_now < SENTENCE_GAP_DBFS:
+                            raw_tail_low_energy_chunks += 1
+                        else:
+                            raw_tail_low_energy_chunks = 0
                         if TAIL_SILENCE_TRIM:
                             chunk_dbfs_now = _calc_chunk_dbfs(pcm_chunk)
                             if chunk_dbfs_now is not None and chunk_dbfs_now < low_energy_dbfs:
@@ -582,6 +595,32 @@ async def handle_llm_tts(text_for_llm: str, websocket: WebSocket, chat_history: 
                         )
 
                 total_tts_ms = (time.perf_counter() - sentence_start) * 1000.0
+                if SENTENCE_GAP_MS > 0 and raw_tail_low_energy_chunks <= SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS:
+                    gap_samples = int((SAMPLE_RATE * SENTENCE_GAP_MS) / 1000)
+                    if gap_samples > 0:
+                        gap_pcm = (np.zeros(gap_samples, dtype=np.int16)).tobytes()
+                        if gap_pcm:
+                            tts_chunk_count += 1
+                            total_len += len(gap_pcm)
+                            sentence_pcm.extend(gap_pcm)
+                            await audio_queue.put(
+                                {
+                                    "type": "chunk",
+                                    "sentence_idx": idx,
+                                    "tts_chunk_idx": tts_chunk_count,
+                                    "worker_id": worker_id,
+                                    "audio_bytes": gap_pcm,
+                                    "total_bytes": 0,
+                                    "chunk_gen_ms": 0.0,
+                                    "created_at": time.perf_counter(),
+                                }
+                            )
+                            logger.info(
+                                f"[TTS_GAP] worker={worker_id} sentence={idx} "
+                                f"added_silence_ms={SENTENCE_GAP_MS} gap_bytes={len(gap_pcm)} "
+                                f"raw_tail_low_energy_chunks={raw_tail_low_energy_chunks} "
+                                f"threshold_dbfs={SENTENCE_GAP_DBFS:.1f}"
+                            )
                 await audio_queue.put(
                     {
                         "type": "done",

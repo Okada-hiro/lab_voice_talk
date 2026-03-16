@@ -82,11 +82,11 @@ class FasterWhisperASR(ASRBase):
 
 # --- ★ 1. グローバル・モデル・ローディング ---
 # (watch_and_transcribe.py が import した時に1回だけ実行される)
-print("[INFO] Whisper (v3) グローバルロード: FasterWhisperASRモデル 'medium' をロード中...")
+print("[INFO] Whisper (v3) グローバルロード: FasterWhisperASRモデル 'large-v3-turbo' をロード中...")
 GLOBAL_ASR_MODEL_INSTANCE = None
 try:
     # watch_and_transcribe.py の設定に合わせる
-    GLOBAL_ASR_MODEL_INSTANCE = FasterWhisperASR(lan="ja", modelsize="medium")
+    GLOBAL_ASR_MODEL_INSTANCE = FasterWhisperASR(lan="ja", modelsize="large-v3-turbo")
     print("[INFO] Whisper (v3) グローバルロード: モデル（オブジェクト）ロード完了。")
 except Exception as e:
     print(f"[ERROR] Whisper (v3) グローバルロード: モデルロードに失敗: {e}")

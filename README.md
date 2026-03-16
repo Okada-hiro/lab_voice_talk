@@ -15,7 +15,7 @@
 ## 環境
 以下はRunPodというGPUが使えてサーバを公開できる環境を想定しています。L4などのpodを作ってください。whisper_streamingが限られたpytorchのバージョンを要求します。具体的には以下の通りです。  
 pytorch=2.8.0+cu128, CUDA=12.8, cuDNN=9.10.2/libcudnnn9-cuda-12   
-互換性のためにtorchvisionとtorchaudioも同じバージョンにする必要があります。setup_environment.shを実行すれば自動でやってくれます。
+互換性のためにtorchvisionとtorchaudioも同じバージョンにする必要があります。setup_environment_qwen3tts_streaming.shを実行すれば自動でやってくれます。
 
 
 ## 使い方
@@ -25,12 +25,18 @@ RunPodでpodを作り、以下のコマンドを実行してください。web�
 1. このレポジトリのクローンをしてください。
 ```bash
 git clone https://okhiro1207@bitbucket.org/concierge_tarou/lab_voice_talk.git
+
+```
+
+2. faster-qwen3-ttsのクローンをしてください。
+```bash
+git clone https://github.com/andimarafioti/faster-qwen3-tts.git
 cd lab_voice_talk
 ```
 
 2. 必要なパッケージのインストールをしてください。
 ```bash
-bash setup_environment.sh
+bash setup_environment_qwen3tts_streaming.sh
 ```
 
 
@@ -40,17 +46,30 @@ git clone https://github.com/ufal/whisper_streaming.git
 ```
 4. ref_audio(参考音声)を指定してください。
 ```bash
-export QWEN3_REF_AUDIO=ref_audio.WAV
+export QWEN3_REF_AUDIO=/workspace/lab_voice_talk/ref_audio.WAV
 ```
 
 5. ref_text(参考テキスト)を指定してください。
 ```bash
  export QWEN3_REF_TEXT="$(cat /workspace/lab_voice_talk/ref_text.txt)"
 ```
-6. ファインチューニング後のStyle-Bert-VITS2の重みを受け取ってください。
+6. qwen3ttsの挙動を安定化させます。以下のコマンドを実行してください。
 ```bash
-python tensorfile_import.py
-mv Ref_voice/* Style_Bert_VITS2/model_assets
+export PERM_TTS_SENTENCE_GAP_MS=80
+export PERM_TTS_SENTENCE_GAP_DBFS=-40
+export PERM_TTS_SENTENCE_GAP_MAX_TAIL_LOW_CHUNKS=1
+export QWEN3_MODEL_PATH=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+export PERM_TTS_TRIM_TAIL_SILENCE=1
+export PERM_TTS_TAIL_SILENCE_DBFS=-42
+export PERM_TTS_TAIL_SILENCE_MAX_TRIM_CHUNKS=240
+export PERM_TTS_TAIL_SILENCE_KEEP_CHUNKS=0
+export PERM_TTS_HEAD_SILENCE_MAX_DROP_CHUNKS=20
+export PERM_TTS_HEAD_SILENCE_MAX_BUFFER_CHUNKS=2
+export PERM_TTS_MAX_CHUNKS_PER_SENTENCE=24
+export PERM_TTS_SAVE_DEBUG_AUDIO=1
+
+export PERM_TTS_WORKER_COUNT=1
+
 ```
 
 7. gemini-2.5-flash-miniを使えるように、APIを設定してください。
@@ -64,19 +83,19 @@ export SB_DISABLE_QUIRKS=disable_jit_profiling
 
 9. 実行
 ```bash
-python new_main_1.py
+python parallel_faster_main.py
 ```
 10. ブラウザで、podのPORT8000のURLを検索して、会話を開始することができるはずです。
 
 ## 性能
 
-それなりの速度で、それなりの音声認識と音声再生が行われます。
+かなりの速度で、それなりの音声認識と音声再生が行われます。
 
-- 速度: ユーザーが話し終えてから大体    秒ぐらいで回答が表示され、2秒ぐらいで音声が再生されます。
+- 速度: ユーザーが話し終えてから大体 1秒ぐらいで回答が表示され、2秒ぐらいで音声が再生されます。
 
-- 音声認識の正確さ: 現時点で、whisper_streamingの音声認識は人間より劣っています。どういう音声が入りやすいのか教えてあげれば性能が良くなります。これはtranscribe_func.pyの変数を変更して実装可能です。また、geminiのプロンプトで誤字脱字があることを書けば、回答生成は問題ありません。
+- 音声認識の正確さ: 現時点で、whisper_streaming(medium)の音声認識は人間より劣っています。どういう音声が入りやすいのか教えてあげれば性能が良くなります。これはtranscribe_func.pyの変数を変更して実装可能です。また、geminiのプロンプトで誤字脱字があることを書けば、回答生成は問題ありません。
 
-- 音声生成の自然さ: 現時点では、ファインチューニングが十分ではないため、生成される日本語音声は、まだギリギリ許容範囲だと感じられるレベルです。  
+- 音声生成の自然さ: qwen3ttsはかなり自然な音声を作ります。1.Bモデルのref_audioによる音声生成には目を見張るものがあります。しかし、そのままだと謎の無音区間や異様に短い文末が生まれるので、工夫が必要です。また「〜ます。」が苦手なようです。なるべく「〜です。」にした方がいいです。
 
 
 
