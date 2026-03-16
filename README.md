@@ -46,7 +46,7 @@ git clone https://github.com/ufal/whisper_streaming.git
 ```
 4. ref_audio(参考音声)を指定してください。
 ```bash
-export QWEN3_REF_AUDIO=/workspace/lab_voice_talk/ref_audio.WAV
+export QWEN3_REF_AUDIO=ref_audio.WAV
 ```
 
 5. ref_text(参考テキスト)を指定してください。
